@@ -1,0 +1,919 @@
+/* =========================================================================
+   ROBOTIC CHESS TERMINAL  -  ESP32-S3 + 800x480 RGB panel (LovyanGFX)
+   =========================================================================
+   SERIAL PROTOCOL (host = Python + Stockfish + Dobot)
+
+   ESP32  ->  HOST
+     SET_ELO:1350        settings screen
+     SET_COLOR:WHITE     settings screen
+     SET_ARM:ALL         arm moves BOTH sides
+     SET_ARM:ENGINE      arm moves only the engine's pieces
+     START_MATCH         settings screen
+     e2e4                human move (UCI, 4-5 chars, promo ok: e7e8q)
+     REMOVED             user confirmed the captured piece is off the board
+     RESET               quit to menu
+     CAL_ENTER           entering calibration mode
+     CAL_CAPTURE:a1      read the arm's pose, store it as corner a1
+     CAL_CAPTURE:gw      store it as the drop spot for captured WHITE pieces
+     CAL_CAPTURE:gb      store it as the drop spot for captured BLACK pieces
+     CAL_SAVE            fit the 4 corners and write board_config.py
+     CAL_EXIT            leave calibration mode
+
+   HOST  ->  ESP32
+     REMOVE:e5           show modal: "take the piece off e5", wait for REMOVED
+     ILLEGAL             roll board back to backup
+     STATUS:CHECKMATE    end-of-game banner
+     e2e4                AI move to apply to the display
+     FEN:<pos>           authoritative board position
+     CAL_OK:a1:x,y,z     corner captured, here are the numbers
+     CAL_SAVED           board_config.py written
+     CAL_ERR:<msg>       something went wrong
+   ========================================================================= */
+
+#define LGFX_USE_V1
+#include <LovyanGFX.hpp>
+#include <lgfx/v1/platforms/esp32s3/Panel_RGB.hpp>
+#include <lgfx/v1/platforms/esp32s3/Bus_RGB.hpp>
+
+class LGFX : public lgfx::LGFX_Device {
+public:
+  lgfx::Bus_RGB _bus_instance;
+  lgfx::Panel_RGB _panel_instance;
+  lgfx::Light_PWM _light_instance;
+  lgfx::Touch_GT911 _touch_instance;
+
+  LGFX(void) {
+    {
+      auto cfg = _panel_instance.config();
+      cfg.memory_width = 800; cfg.memory_height = 480;
+      cfg.panel_width = 800;  cfg.panel_height = 480;
+      _panel_instance.config(cfg);
+    }
+    {
+      auto cfg = _bus_instance.config();
+      cfg.panel = &_panel_instance;
+      cfg.pin_d0 = 8;   cfg.pin_d1 = 3;   cfg.pin_d2 = 46;  cfg.pin_d3 = 9;
+      cfg.pin_d4 = 1;   cfg.pin_d5 = 5;   cfg.pin_d6 = 6;   cfg.pin_d7 = 7;
+      cfg.pin_d8 = 15;  cfg.pin_d9 = 16;  cfg.pin_d10 = 4;  cfg.pin_d11 = 45;
+      cfg.pin_d12 = 48; cfg.pin_d13 = 47; cfg.pin_d14 = 21; cfg.pin_d15 = 14;
+      cfg.pin_henable = 40; cfg.pin_vsync = 41; cfg.pin_hsync = 39; cfg.pin_pclk = 0;
+      cfg.freq_write = 15000000;
+      cfg.hsync_polarity = 0; cfg.hsync_front_porch = 8; cfg.hsync_pulse_width = 4; cfg.hsync_back_porch = 43;
+      cfg.vsync_polarity = 0; cfg.vsync_front_porch = 8; cfg.vsync_pulse_width = 4; cfg.vsync_back_porch = 12;
+      cfg.pclk_active_neg = 1; cfg.de_idle_high = 0; cfg.pclk_idle_high = 0;
+      _bus_instance.config(cfg);
+    }
+    _panel_instance.setBus(&_bus_instance);
+    {
+      auto cfg = _touch_instance.config();
+      cfg.x_min = 0; cfg.x_max = 799; cfg.y_min = 0; cfg.y_max = 479;
+      cfg.bus_shared = false; cfg.pin_sda = 19; cfg.pin_scl = 20; cfg.pin_int = -1; cfg.pin_rst = 38;
+      cfg.freq = 400000;
+      _touch_instance.config(cfg);
+    }
+    _panel_instance.setTouch(&_touch_instance);
+    {
+      auto cfg = _light_instance.config();
+      cfg.pin_bl = GPIO_NUM_2;
+      _light_instance.config(cfg);
+    }
+    _panel_instance.light(&_light_instance);
+    setPanel(&_panel_instance);
+  }
+};
+
+LGFX tft;
+const int SQUARE_SIZE = 60;
+
+enum GameState { START_SCREEN, SETTINGS_SCREEN, PLAY_SCREEN, CALIBRATION_SCREEN };
+GameState currentState = START_SCREEN;
+
+int  selectedElo    = 1350;
+bool playingAsWhite = true;
+bool armMovesAll    = false;   // false = arm plays the engine only
+                               // true  = arm plays BOTH sides
+
+char board[8][8];
+char backupBoard[8][8];
+String gameStatusText = "";
+
+// --- calibration state ---
+#define CAL_N 6
+const char* CAL_CORNERS[CAL_N] = {"a1", "h1", "a8", "h8", "gw", "gb"};
+const char* CAL_LABELS[CAL_N]  = {"A1", "H1", "A8", "H8", "DROP W", "DROP B"};
+String calValue[CAL_N] = {"", "", "", "", "", ""};
+bool   calDone[CAL_N]  = {false, false, false, false, false, false};
+int    calIndex        = 0;
+String calMessage      = "";
+bool   calBusy         = false;   // CAPTURE is locked until the host replies
+
+// --- capture-removal modal state ---
+bool   awaitingRemoval   = false;   // blocks all board input while true
+String removalSquare     = "";      // e.g. "e5"
+char   removalPiece      = '.';     // piece that was sitting there (for the prompt art)
+
+const char initialBoard[8][8] = {
+  {'r', 'n', 'b', 'q', 'k', 'b', 'n', 'r'},
+  {'p', 'p', 'p', 'p', 'p', 'p', 'p', 'p'},
+  {'.', '.', '.', '.', '.', '.', '.', '.'},
+  {'.', '.', '.', '.', '.', '.', '.', '.'},
+  {'.', '.', '.', '.', '.', '.', '.', '.'},
+  {'.', '.', '.', '.', '.', '.', '.', '.'},
+  {'P', 'P', 'P', 'P', 'P', 'P', 'P', 'P'},
+  {'R', 'N', 'B', 'Q', 'K', 'B', 'N', 'R'}
+};
+
+bool selectMode = false;
+int  fromCol = -1, fromRow = -1;   // board indices (rank8 = row 0)
+
+void drawStartScreen();
+void drawSettingsScreen();
+void drawPlayInterface();
+void renderBoardState();
+void executeMoveOnMatrix(String moveStr);
+void applyFEN(String fen);
+void drawCalibrationScreen();
+void handleTouchCalibration(int x, int y);
+void handleTouchStart(int x, int y);
+void handleTouchSettings(int x, int y);
+void handleTouchPlay(int x, int y);
+void handleTouchRemoval(int x, int y);
+void showRemovalPrompt(String square);
+void hideRemovalPrompt();
+void resetLocalGame();
+void drawChessPiece(int x, int y, char piece);
+void setSidePanelMessage(String msg, uint16_t color);
+void highlightSquare(int row, int col, uint16_t color);
+
+// Board index  ->  screen cell (flips the view when the human plays Black)
+inline int screenRow(int row) { return playingAsWhite ? row : 7 - row; }
+inline int screenCol(int col) { return playingAsWhite ? col : 7 - col; }
+inline int boardRowFromScreen(int r) { return playingAsWhite ? r : 7 - r; }
+inline int boardColFromScreen(int c) { return playingAsWhite ? c : 7 - c; }
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  tft.init();
+  tft.setRotation(0);
+  drawStartScreen();
+}
+
+void loop() {
+  // ---------------- INCOMING HOST MESSAGES ----------------
+  if ((currentState == PLAY_SCREEN || currentState == CALIBRATION_SCREEN)
+      && Serial.available() > 0) {
+    String response = Serial.readStringUntil('\n');
+    response.trim();
+
+    // ---- calibration replies ----
+    if (response.startsWith("CAL_OK:")) {
+      // CAL_OK:a1:320.1,-78.4,-17.5
+      String body = response.substring(7);
+      int c1 = body.indexOf(':');
+      String sq = body.substring(0, c1);
+      String nums = body.substring(c1 + 1);
+
+      int c2 = nums.indexOf(',');
+      int c3 = nums.indexOf(',', c2 + 1);
+      String xs = nums.substring(0, c2);
+      String ys = nums.substring(c2 + 1, c3);
+      String zs = nums.substring(c3 + 1);
+
+      for (int i = 0; i < CAL_N; i++) {
+        if (sq == CAL_CORNERS[i]) {
+          calValue[i] = "X " + xs + "  Y " + ys + "  Z " + zs;
+          calDone[i] = true;
+          if (calIndex == i && i < CAL_N - 1) calIndex = i + 1;   // advance
+        }
+      }
+      calMessage = "Captured " + sq + " - now MOVE THE ARM to the next one";
+      calBusy = false;
+      drawCalibrationScreen();
+      return;
+    }
+    else if (response == "CAL_SAVED") {
+      calBusy = false;
+      calMessage = "SAVED to board_config.py";
+      drawCalibrationScreen();
+      return;
+    }
+    else if (response.startsWith("CAL_ERR:")) {
+      calBusy = false;
+      calMessage = response.substring(8);
+      drawCalibrationScreen();
+      return;
+    }
+
+    if (currentState != PLAY_SCREEN) return;
+
+    if (response == "ILLEGAL") {
+      memcpy(board, backupBoard, sizeof(backupBoard));
+      selectMode = false;
+      setSidePanelMessage("Move Illegal!", TFT_RED);
+      renderBoardState();
+    }
+    else if (response.startsWith("REMOVE:")) {
+      // Host detected a capture. Ask the human to physically clear the square.
+      showRemovalPrompt(response.substring(7));
+    }
+    else if (response.startsWith("FEN:")) {
+      // Host is authoritative. Render exactly what it says, no guessing.
+      applyFEN(response.substring(4));
+      renderBoardState();
+    }
+    else if (response.startsWith("STATUS:")) {
+      gameStatusText = response.substring(7);
+      tft.fillRect(495, 195, 300, 90, TFT_BLACK);
+      tft.setTextColor(TFT_YELLOW);
+      tft.setTextSize(3);
+      tft.drawString(gameStatusText, 500, 230);
+      tft.setTextSize(2);
+    }
+    else if (response.length() >= 4 && !awaitingRemoval) {
+      setSidePanelMessage("AI Played: " + response, TFT_GREEN);
+      executeMoveOnMatrix(response);
+      renderBoardState();
+      // flash the destination square so the human can see what moved
+      int tCol = response[2] - 'a';
+      int tRow = 8 - (response[3] - '0');
+      highlightSquare(tRow, tCol, TFT_GREEN);
+    }
+  }
+
+  // ---------------- TOUCH ----------------
+  int tx = 0, ty = 0;
+  if (tft.getTouch(&tx, &ty)) {
+    if (awaitingRemoval)                       handleTouchRemoval(tx, ty);
+    else if (currentState == START_SCREEN)     handleTouchStart(tx, ty);
+    else if (currentState == SETTINGS_SCREEN)  handleTouchSettings(tx, ty);
+    else if (currentState == PLAY_SCREEN)      handleTouchPlay(tx, ty);
+    else if (currentState == CALIBRATION_SCREEN) handleTouchCalibration(tx, ty);
+    delay(200);
+  }
+}
+
+// =========================================================================
+//  CAPTURE REMOVAL PROMPT
+// =========================================================================
+void showRemovalPrompt(String square) {
+  square.trim();
+  square.toLowerCase();
+  if (square.length() < 2) return;
+
+  awaitingRemoval = true;
+  removalSquare   = square;
+  selectMode      = false;
+
+  int col = square[0] - 'a';
+  int row = 8 - (square[1] - '0');
+  removalPiece = (row >= 0 && row < 8 && col >= 0 && col < 8) ? board[row][col] : '.';
+
+  // Blink the doomed square in red on the board itself
+  renderBoardState();
+  highlightSquare(row, col, TFT_RED);
+
+  // ----- modal panel -----
+  int mx = 120, my = 110, mw = 560, mh = 260;
+  tft.fillRoundRect(mx, my, mw, mh, 14, tft.color565(25, 25, 30));
+  tft.drawRoundRect(mx, my, mw, mh, 14, TFT_RED);
+  tft.drawRoundRect(mx + 1, my + 1, mw - 2, mh - 2, 14, TFT_RED);
+
+  tft.setTextSize(3);
+  tft.setTextColor(TFT_RED);
+  tft.drawCenterString("PIECE CAPTURED", mx + mw / 2, my + 22);
+
+  tft.setTextSize(2);
+  tft.setTextColor(TFT_WHITE);
+  tft.drawCenterString("Please take the piece off square", mx + mw / 2, my + 70);
+
+  // big square name
+  String label = square;
+  label.toUpperCase();
+  tft.setTextSize(6);
+  tft.setTextColor(TFT_YELLOW);
+  tft.drawCenterString(label, mx + mw / 2, my + 100);
+
+  tft.setTextSize(2);
+  tft.setTextColor(tft.color565(170, 170, 175));
+  tft.drawCenterString("The arm waits until you confirm", mx + mw / 2, my + 165);
+
+  // confirm button
+  tft.fillRoundRect(mx + 150, my + 195, 260, 52, 10, tft.color565(40, 150, 40));
+  tft.drawRoundRect(mx + 150, my + 195, 260, 52, 10, TFT_WHITE);
+  tft.setTextSize(3);
+  tft.setTextColor(TFT_WHITE);
+  tft.drawCenterString("DONE", mx + mw / 2, my + 208);
+  tft.setTextSize(2);
+
+  setSidePanelMessage("Waiting on you...", TFT_RED);
+}
+
+void handleTouchRemoval(int x, int y) {
+  int mx = 120, my = 110, mw = 560;
+  int bx = mx + 150, by = my + 195, bw = 260, bh = 52;
+
+  if (x >= bx && x <= bx + bw && y >= by && y <= by + bh) {
+    // Clear the captured piece from our local matrix and tell the host
+    int col = removalSquare[0] - 'a';
+    int row = 8 - (removalSquare[1] - '0');
+    if (row >= 0 && row < 8 && col >= 0 && col < 8) board[row][col] = '.';
+
+    Serial.println("REMOVED");
+    hideRemovalPrompt();
+  }
+}
+
+void hideRemovalPrompt() {
+  awaitingRemoval = false;
+  removalSquare = "";
+  removalPiece  = '.';
+  // Repaint everything the modal covered (board + right panel strip)
+  drawPlayInterface();
+  renderBoardState();
+  if (gameStatusText != "") {
+    tft.setTextColor(TFT_YELLOW);
+    tft.setTextSize(3);
+    tft.drawString(gameStatusText, 500, 230);
+    tft.setTextSize(2);
+  } else {
+    setSidePanelMessage("Square cleared.", TFT_GREEN);
+  }
+}
+
+// =========================================================================
+//  SIDE PANEL / HIGHLIGHT HELPERS
+// =========================================================================
+void setSidePanelMessage(String msg, uint16_t color) {
+  tft.fillRect(495, 195, 300, 40, TFT_BLACK);
+  tft.setTextSize(2);
+  tft.setTextColor(color);
+  tft.drawString(msg, 500, 200);
+}
+
+void highlightSquare(int row, int col, uint16_t color) {
+  if (row < 0 || row > 7 || col < 0 || col > 7) return;
+  int px = screenCol(col) * SQUARE_SIZE;
+  int py = screenRow(row) * SQUARE_SIZE;
+  tft.drawRect(px, py, SQUARE_SIZE, SQUARE_SIZE, color);
+  tft.drawRect(px + 1, py + 1, SQUARE_SIZE - 2, SQUARE_SIZE - 2, color);
+  tft.drawRect(px + 2, py + 2, SQUARE_SIZE - 4, SQUARE_SIZE - 4, color);
+}
+
+// =========================================================================
+//  PIECE GRAPHICS
+// =========================================================================
+void drawChessPiece(int x, int y, char piece) {
+  bool isWhite = (piece >= 'A' && piece <= 'Z');
+  uint16_t bodyColor   = isWhite ? TFT_WHITE : tft.color565(45, 45, 45);
+  uint16_t borderColor = isWhite ? tft.color565(90, 90, 90) : TFT_WHITE;
+  uint16_t accentColor = isWhite ? tft.color565(180, 180, 180) : tft.color565(90, 90, 90);
+
+  char type = tolower(piece);
+  int cx = x + 30;
+  int cy = y + 30;
+
+  switch (type) {
+    case 'p':
+      tft.fillCircle(cx, cy - 10, 7, bodyColor);
+      tft.drawCircle(cx, cy - 10, 7, borderColor);
+      tft.fillRoundRect(cx - 10, cy - 2, 20, 15, 4, bodyColor);
+      tft.drawRoundRect(cx - 10, cy - 2, 20, 15, 4, borderColor);
+      tft.fillRoundRect(cx - 14, cy + 12, 28, 6, 2, bodyColor);
+      tft.drawRoundRect(cx - 14, cy + 12, 28, 6, 2, borderColor);
+      break;
+
+    case 'r':
+      tft.fillRect(cx - 12, cy - 10, 24, 22, bodyColor);
+      tft.drawRect(cx - 12, cy - 10, 24, 22, borderColor);
+      tft.fillRect(cx - 12, cy - 15, 6, 6, bodyColor);  tft.drawRect(cx - 12, cy - 15, 6, 6, borderColor);
+      tft.fillRect(cx - 3, cy - 15, 6, 6, bodyColor);   tft.drawRect(cx - 3, cy - 15, 6, 6, borderColor);
+      tft.fillRect(cx + 6, cy - 15, 6, 6, bodyColor);   tft.drawRect(cx + 6, cy - 15, 6, 6, borderColor);
+      tft.fillRoundRect(cx - 16, cy + 11, 32, 7, 2, bodyColor);
+      tft.drawRoundRect(cx - 16, cy + 11, 32, 7, 2, borderColor);
+      break;
+
+    case 'n':
+      tft.fillRoundRect(cx - 10, cy - 15, 22, 26, 6, bodyColor);
+      tft.drawRoundRect(cx - 10, cy - 15, 22, 26, 6, borderColor);
+      tft.fillCircle(cx - 11, cy - 6, 7, bodyColor);
+      tft.drawCircle(cx - 11, cy - 6, 7, borderColor);
+      tft.fillRect(cx - 18, cy - 6, 10, 12, bodyColor);
+      tft.drawRect(cx - 18, cy - 6, 10, 12, borderColor);
+      tft.fillTriangle(cx, cy - 14, cx + 8, cy - 22, cx + 8, cy - 14, bodyColor);
+      tft.drawTriangle(cx, cy - 14, cx + 8, cy - 22, cx + 8, cy - 14, borderColor);
+      tft.fillCircle(cx - 11, cy - 6, 5, bodyColor);
+      tft.fillRoundRect(cx - 16, cy + 11, 32, 7, 2, bodyColor);
+      tft.drawRoundRect(cx - 16, cy + 11, 32, 7, 2, borderColor);
+      break;
+
+    case 'b':
+      tft.fillEllipse(cx, cy - 4, 11, 15, bodyColor);
+      tft.drawEllipse(cx, cy - 4, 11, 15, borderColor);
+      tft.fillCircle(cx, cy - 20, 3, bodyColor);
+      tft.drawCircle(cx, cy - 20, 3, borderColor);
+      tft.drawLine(cx - 4, cy - 8, cx + 4, cy + 2, accentColor);
+      tft.fillRoundRect(cx - 15, cy + 11, 30, 7, 2, bodyColor);
+      tft.drawRoundRect(cx - 15, cy + 11, 30, 7, 2, borderColor);
+      break;
+
+    case 'q':
+      tft.fillTriangle(cx - 15, cy - 8, cx + 15, cy - 8, cx, cy + 14, bodyColor);
+      tft.drawTriangle(cx - 15, cy - 8, cx + 15, cy - 8, cx, cy + 14, borderColor);
+      tft.fillCircle(cx - 14, cy - 15, 2, borderColor);
+      tft.fillTriangle(cx - 15, cy - 8, cx - 11, cy - 15, cx - 6, cy - 8, bodyColor);
+      tft.drawTriangle(cx - 15, cy - 8, cx - 11, cy - 15, cx - 6, cy - 8, borderColor);
+      tft.fillCircle(cx, cy - 19, 2, borderColor);
+      tft.fillTriangle(cx - 5, cy - 8, cx, cy - 18, cx + 5, cy - 8, bodyColor);
+      tft.drawTriangle(cx - 5, cy - 8, cx, cy - 18, cx + 5, cy - 8, borderColor);
+      tft.fillCircle(cx + 14, cy - 15, 2, borderColor);
+      tft.fillTriangle(cx + 6, cy - 8, cx + 11, cy - 15, cx + 15, cy - 8, bodyColor);
+      tft.drawTriangle(cx + 6, cy - 8, cx + 11, cy - 15, cx + 15, cy - 8, borderColor);
+      tft.fillRoundRect(cx - 16, cy + 12, 32, 6, 2, bodyColor);
+      tft.drawRoundRect(cx - 16, cy + 12, 32, 6, 2, borderColor);
+      break;
+
+    case 'k':
+      tft.fillRect(cx - 13, cy - 6, 26, 18, bodyColor);
+      tft.drawRect(cx - 13, cy - 6, 26, 18, borderColor);
+      tft.fillCircle(cx, cy - 4, 12, bodyColor);
+      tft.drawCircle(cx, cy - 4, 12, borderColor);
+      tft.fillRect(cx - 12, cy - 5, 24, 16, bodyColor);
+      tft.fillRect(cx - 2, cy - 21, 5, 12, bodyColor);   tft.drawRect(cx - 2, cy - 21, 5, 12, borderColor);
+      tft.fillRect(cx - 6, cy - 18, 13, 4, bodyColor);   tft.drawRect(cx - 6, cy - 18, 13, 4, borderColor);
+      tft.fillRoundRect(cx - 16, cy + 12, 32, 6, 2, bodyColor);
+      tft.drawRoundRect(cx - 16, cy + 12, 32, 6, 2, borderColor);
+      break;
+  }
+}
+
+// =========================================================================
+//  SCREENS
+// =========================================================================
+void drawStartScreen() {
+  tft.fillScreen(TFT_BLACK);
+  tft.setTextColor(TFT_WHITE);
+  tft.setTextSize(4);
+  tft.drawCenterString("ROBOTIC CHESS ENGINE", 400, 140);
+  tft.setTextSize(2);
+  tft.setTextColor(TFT_CYAN);
+  tft.drawCenterString("VIPER Lab Outreach Terminal", 400, 190);
+
+  tft.fillRoundRect(280, 270, 240, 70, 12, tft.color565(40, 150, 40));
+  tft.drawRoundRect(280, 270, 240, 70, 12, TFT_WHITE);
+  tft.setTextColor(TFT_WHITE);
+  tft.setTextSize(3);
+  tft.drawCenterString("ENTER GAME", 400, 292);
+
+  tft.fillRoundRect(280, 360, 240, 60, 12, tft.color565(70, 70, 90));
+  tft.drawRoundRect(280, 360, 240, 60, 12, TFT_WHITE);
+  tft.setTextSize(2);
+  tft.setTextColor(TFT_WHITE);
+  tft.drawCenterString("CALIBRATE ARM", 400, 380);
+}
+
+void drawSettingsScreen() {
+  tft.fillScreen(tft.color565(20, 25, 35));
+  // back button, top-left corner
+  tft.fillRoundRect(20, 20, 90, 46, 8, tft.color565(90, 40, 40));
+  tft.drawRoundRect(20, 20, 90, 46, 8, TFT_WHITE);
+  tft.setTextColor(TFT_WHITE);
+  tft.setTextSize(2);
+  tft.drawCenterString("< BACK", 65, 34);
+
+  tft.setTextColor(TFT_WHITE);
+  tft.setTextSize(3);
+  tft.drawString("MATCH CONFIGURATION", 130, 30);
+  tft.drawFastHLine(20, 80, 720, tft.color565(100, 100, 120));
+
+  tft.setTextSize(2);
+  tft.setTextColor(tft.color565(180, 180, 190));
+  tft.drawString("1. Choose Difficulty (ELO Rating Target):", 60, 120);
+
+  tft.fillRoundRect(60, 160, 200, 60, 6, (selectedElo == 800) ? TFT_GREEN : tft.color565(60, 65, 75));
+  tft.drawRoundRect(60, 160, 200, 60, 6, TFT_WHITE);
+  tft.setTextColor(TFT_WHITE); tft.drawCenterString("EASY (800)", 160, 180);
+
+  tft.fillRoundRect(290, 160, 200, 60, 6, (selectedElo == 1350) ? TFT_BLUE : tft.color565(60, 65, 75));
+  tft.drawRoundRect(290, 160, 200, 60, 6, TFT_WHITE);
+  tft.setTextColor(TFT_WHITE); tft.drawCenterString("MEDIUM (1350)", 390, 180);
+
+  tft.fillRoundRect(520, 160, 200, 60, 6, (selectedElo == 2000) ? TFT_RED : tft.color565(60, 65, 75));
+  tft.drawRoundRect(520, 160, 200, 60, 6, TFT_WHITE);
+  tft.setTextColor(TFT_WHITE); tft.drawCenterString("HARD (2000)", 620, 180);
+
+  tft.setTextColor(tft.color565(180, 180, 190));
+  tft.drawString("2. Pick Your Army Color Side:", 60, 240);
+
+  tft.fillRoundRect(60, 268, 310, 48, 6, playingAsWhite ? tft.color565(200, 160, 40) : tft.color565(60, 65, 75));
+  tft.drawRoundRect(60, 268, 310, 48, 6, TFT_WHITE);
+  tft.setTextColor(playingAsWhite ? TFT_BLACK : TFT_WHITE);
+  tft.drawCenterString("PLAY AS WHITE", 215, 282);
+
+  tft.fillRoundRect(410, 268, 310, 48, 6, !playingAsWhite ? tft.color565(200, 160, 40) : tft.color565(60, 65, 75));
+  tft.drawRoundRect(410, 268, 310, 48, 6, TFT_WHITE);
+  tft.setTextColor(!playingAsWhite ? TFT_BLACK : TFT_WHITE);
+  tft.drawCenterString("PLAY AS BLACK", 565, 282);
+
+  // --- 3. who does the arm move? ---
+  tft.setTextColor(tft.color565(180, 180, 190));
+  tft.drawString("3. Which Pieces Does The Arm Move?", 60, 332);
+
+  tft.fillRoundRect(60, 360, 310, 48, 6, !armMovesAll ? tft.color565(50, 150, 190) : tft.color565(60, 65, 75));
+  tft.drawRoundRect(60, 360, 310, 48, 6, !armMovesAll ? TFT_CYAN : tft.color565(110, 110, 120));
+  tft.setTextColor(TFT_WHITE);
+  tft.drawCenterString(!armMovesAll ? "> ENGINE ONLY <" : "ENGINE ONLY", 215, 374);
+
+  tft.fillRoundRect(410, 360, 310, 48, 6, armMovesAll ? tft.color565(50, 150, 190) : tft.color565(60, 65, 75));
+  tft.drawRoundRect(410, 360, 310, 48, 6, armMovesAll ? TFT_CYAN : tft.color565(110, 110, 120));
+  tft.setTextColor(TFT_WHITE);
+  tft.drawCenterString(armMovesAll ? "> BOTH SIDES <" : "BOTH SIDES", 565, 374);
+
+  tft.fillRoundRect(270, 422, 260, 50, 10, tft.color565(210, 100, 10));
+  tft.drawRoundRect(270, 422, 260, 50, 10, TFT_WHITE);
+  tft.setTextColor(TFT_WHITE); tft.setTextSize(3);
+  tft.drawCenterString("LAUNCH GAME", 400, 435);
+  tft.setTextSize(2);
+}
+
+void drawPlayInterface() {
+  tft.fillScreen(TFT_BLACK);
+  tft.drawFastVLine(480, 0, 480, tft.color565(80, 80, 80));
+
+  tft.setTextColor(TFT_WHITE); tft.setTextSize(3);
+  tft.drawString("STOCKFISH", 500, 20);
+  tft.drawString("TERMINAL", 500, 55);
+
+  tft.setTextSize(2); tft.setTextColor(tft.color565(160, 160, 160));
+  tft.drawString("Engine ELO Level:", 500, 110);
+  tft.setTextColor(TFT_CYAN);
+  tft.drawString(String(selectedElo) + " Locked", 500, 135);
+
+  tft.setTextColor(tft.color565(120, 120, 120));
+  tft.drawString(playingAsWhite ? "You: WHITE" : "You: BLACK", 500, 160);
+  tft.drawString(armMovesAll ? "Arm: BOTH SIDES" : "Arm: ENGINE ONLY", 500, 180);
+
+  tft.fillRoundRect(520, 390, 240, 55, 8, tft.color565(120, 30, 30));
+  tft.drawRoundRect(520, 390, 240, 55, 8, TFT_WHITE);
+  tft.setTextColor(TFT_WHITE);
+  tft.drawString("QUIT TO MENU", 565, 408);
+}
+
+void renderBoardState() {
+  for (int row = 0; row < 8; row++) {
+    for (int col = 0; col < 8; col++) {
+      int sRow = screenRow(row);
+      int sCol = screenCol(col);
+      uint16_t sqColor = ((row + col) % 2 == 0) ? tft.color565(240, 217, 181)
+                                                : tft.color565(181, 136, 99);
+      int posX = sCol * SQUARE_SIZE;
+      int posY = sRow * SQUARE_SIZE;
+
+      tft.fillRect(posX, posY, SQUARE_SIZE, SQUARE_SIZE, sqColor);
+
+      char piece = board[row][col];
+      if (piece != '.') drawChessPiece(posX, posY, piece);
+    }
+  }
+  if (selectMode) highlightSquare(fromRow, fromCol, TFT_CYAN);
+}
+
+// =========================================================================
+//  TOUCH ROUTINES  (coordinates passed in - no second, stale getTouch call)
+// =========================================================================
+void handleTouchStart(int x, int y) {
+  if (x >= 280 && x <= 520 && y >= 270 && y <= 340) {
+    currentState = SETTINGS_SCREEN;
+    drawSettingsScreen();
+    return;
+  }
+  if (x >= 280 && x <= 520 && y >= 360 && y <= 420) {
+    Serial.println("CAL_ENTER");
+    currentState = CALIBRATION_SCREEN;
+    calIndex = 0;
+    calBusy = false;
+    calMessage = "Jog the arm by hand, then CAPTURE.";
+    for (int i = 0; i < CAL_N; i++) { calDone[i] = false; calValue[i] = ""; }
+    drawCalibrationScreen();
+  }
+}
+
+void handleTouchSettings(int x, int y) {
+  // back to the start screen
+  if (x >= 20 && x <= 110 && y >= 20 && y <= 66) {
+    currentState = START_SCREEN;
+    drawStartScreen();
+    return;
+  }
+
+  if (y >= 160 && y <= 220) {
+    if (x >= 60 && x <= 260)       { selectedElo = 800;  drawSettingsScreen(); }
+    else if (x >= 290 && x <= 490) { selectedElo = 1350; drawSettingsScreen(); }
+    else if (x >= 520 && x <= 720) { selectedElo = 2000; drawSettingsScreen(); }
+    return;
+  }
+
+  // colour: generous hit box (button is y 268-316)
+  if (y >= 258 && y <= 326) {
+    if (x >= 40 && x <= 390)       { playingAsWhite = true;  drawSettingsScreen(); }
+    else if (x >= 395 && x <= 760) { playingAsWhite = false; drawSettingsScreen(); }
+    return;
+  }
+
+  // who the arm moves: generous hit box (button is y 360-408)
+  if (y >= 340 && y <= 416) {
+    if (x >= 40 && x <= 390)       { armMovesAll = false; drawSettingsScreen(); }
+    else if (x >= 395 && x <= 760) { armMovesAll = true;  drawSettingsScreen(); }
+    Serial.println("SET_ARM:" + String(armMovesAll ? "ALL" : "ENGINE"));  // tell host now too
+    return;
+  }
+
+  if (x >= 255 && x <= 545 && y >= 420 && y <= 479) {
+    Serial.println("SET_ELO:" + String(selectedElo));
+    delay(50);
+    Serial.println("SET_COLOR:" + String(playingAsWhite ? "WHITE" : "BLACK"));
+    delay(50);
+    Serial.println("SET_ARM:" + String(armMovesAll ? "ALL" : "ENGINE"));
+    delay(50);
+    Serial.println("START_MATCH");
+
+    currentState = PLAY_SCREEN;
+    resetLocalGame();
+  }
+}
+
+void handleTouchPlay(int x, int y) {
+  // Quit button
+  if (x >= 520 && x <= 760 && y >= 390 && y <= 445) {
+    Serial.println("RESET");
+    currentState = SETTINGS_SCREEN;
+    gameStatusText = "";
+    selectMode = false;
+    drawSettingsScreen();
+    return;
+  }
+
+  if (gameStatusText != "") return;   // game is over
+  if (x >= 480 || y >= 480) return;   // outside the board
+
+  int sCol = x / SQUARE_SIZE;
+  int sRow = y / SQUARE_SIZE;
+  int col  = boardColFromScreen(sCol);
+  int row  = boardRowFromScreen(sRow);
+
+  char p = board[row][col];
+  bool isWhitePiece = (p >= 'A' && p <= 'Z');
+  bool isMyPiece    = (p != '.') && ((playingAsWhite && isWhitePiece) || (!playingAsWhite && !isWhitePiece));
+
+  if (!selectMode) {
+    if (!isMyPiece) return;
+    fromCol = col; fromRow = row;
+    selectMode = true;
+    highlightSquare(row, col, TFT_CYAN);
+    return;
+  }
+
+  // Tapping the same square cancels the selection
+  if (row == fromRow && col == fromCol) {
+    selectMode = false;
+    renderBoardState();
+    return;
+  }
+
+  // Tapping another of your own pieces re-selects it instead of making a bad move
+  if (isMyPiece) {
+    fromCol = col; fromRow = row;
+    renderBoardState();
+    highlightSquare(row, col, TFT_CYAN);
+    return;
+  }
+
+  // Build the UCI string and send it
+  char sf = 'a' + fromCol;
+  char sr = '8' - fromRow;
+  char df = 'a' + col;
+  char dr = '8' - row;
+  String moveStr = String(sf) + String(sr) + String(df) + String(dr);
+
+  // Auto-queen on promotion so the host doesn't reject the move
+  char mover = board[fromRow][fromCol];
+  if ((mover == 'P' && row == 0) || (mover == 'p' && row == 7)) moveStr += "q";
+
+  memcpy(backupBoard, board, sizeof(board));
+  executeMoveOnMatrix(moveStr);
+  selectMode = false;
+  renderBoardState();
+  setSidePanelMessage("You: " + moveStr, TFT_CYAN);
+
+  Serial.println(moveStr);
+}
+
+void resetLocalGame() {
+  memcpy(board, initialBoard, sizeof(initialBoard));
+  memcpy(backupBoard, initialBoard, sizeof(initialBoard));
+  selectMode = false;
+  awaitingRemoval = false;
+  fromCol = -1; fromRow = -1;
+  gameStatusText = "";
+  drawPlayInterface();
+  renderBoardState();
+}
+
+void executeMoveOnMatrix(String moveStr) {
+  if (moveStr.length() < 4) return;  int fCol = moveStr[0] - 'a'; int fRow = 8 - (moveStr[1] - '0');
+  int tCol = moveStr[2] - 'a'; int tRow = 8 - (moveStr[3] - '0');
+  if (fCol < 0 || fCol > 7 || fRow < 0 || fRow > 7 || tCol < 0 || tCol > 7 || tRow < 0 || tRow > 7) return;
+
+  char piece = board[fRow][fCol];
+  if (piece == '.') return;
+
+  // --- en passant: pawn moves diagonally onto an empty square ---
+  if (tolower(piece) == 'p' && fCol != tCol && board[tRow][tCol] == '.') {
+    board[fRow][tCol] = '.';
+  }
+
+  // --- castling: king jumps two files, so drag the rook along ---
+  if (tolower(piece) == 'k' && abs(tCol - fCol) == 2) {
+    if (tCol == 6) { board[fRow][5] = board[fRow][7]; board[fRow][7] = '.'; }  // king side
+    if (tCol == 2) { board[fRow][3] = board[fRow][0]; board[fRow][0] = '.'; }  // queen side
+  }
+
+  board[fRow][fCol] = '.';
+
+  // --- promotion (5th char, e.g. e7e8q) ---
+  if (moveStr.length() >= 5) {
+    char promo = moveStr[4];
+    piece = (piece >= 'A' && piece <= 'Z') ? toupper(promo) : tolower(promo);
+  }
+
+  board[tRow][tCol] = piece;
+}
+
+// =========================================================================
+//  FEN  ->  board matrix.  The host is the single source of truth, so the
+//  display can never silently drift out of sync and "lose" a piece.
+//  Example: rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR
+// =========================================================================
+void applyFEN(String fen) {
+  fen.trim();
+  int space = fen.indexOf(' ');
+  if (space > 0) fen = fen.substring(0, space);   // drop side-to-move, castling, etc.
+
+  char fresh[8][8];
+  for (int r = 0; r < 8; r++)
+    for (int c = 0; c < 8; c++) fresh[r][c] = '.';
+
+  int row = 0, col = 0;
+  for (unsigned int i = 0; i < fen.length(); i++) {
+    char ch = fen[i];
+    if (ch == '/') { row++; col = 0; continue; }
+    if (row > 7 || col > 7) break;
+
+    if (ch >= '1' && ch <= '8') {
+      col += (ch - '0');                          // run of empty squares
+    } else {
+      fresh[row][col] = ch;
+      col++;
+    }
+  }
+
+  if (row != 7) return;                           // malformed: keep the old board
+  memcpy(board, fresh, sizeof(board));
+  memcpy(backupBoard, fresh, sizeof(fresh));
+  selectMode = false;
+}
+
+// =========================================================================
+//  CALIBRATION SCREEN
+//  Hold the arm's unlock button, jog the claw onto the corner square, then
+//  tap CAPTURE. Do all four, tap SAVE, and the host writes board_config.py.
+// =========================================================================
+void drawCalibrationScreen() {
+  tft.fillScreen(tft.color565(18, 20, 28));
+
+  tft.setTextColor(TFT_WHITE);
+  tft.setTextSize(3);
+  tft.drawString("ARM CALIBRATION", 40, 25);
+  tft.drawFastHLine(40, 62, 720, tft.color565(90, 90, 110));
+
+  tft.setTextSize(2);
+  tft.setTextColor(tft.color565(170, 170, 180));
+  tft.drawString("Hold the unlock button, put the claw where it would GRIP", 40, 78);
+  tft.drawString("a piece on the CENTRE of the square, then tap CAPTURE.", 40, 100);
+  tft.setTextColor(tft.color565(230, 170, 70));
+  tft.drawString("DROP W / DROP B = off-board spots for captured white / black.", 40, 112);
+
+  // --- the four corners + the graveyard drop spot ---
+  for (int i = 0; i < CAL_N; i++) {
+    int ry = 128 + i * 42;
+    bool active = (i == calIndex);
+    bool isGrave = (i >= 4);
+
+    uint16_t rowBg = active ? tft.color565(50, 90, 140)
+                            : (calDone[i] ? tft.color565(30, 70, 40)
+                                          : tft.color565(38, 40, 50));
+    tft.fillRoundRect(40, ry, 500, 36, 6, rowBg);
+    tft.drawRoundRect(40, ry, 500, 36, 6,
+                      active ? TFT_CYAN : (isGrave ? tft.color565(150, 110, 50)
+                                                   : tft.color565(80, 80, 95)));
+
+    tft.setTextSize(2);
+    tft.setTextColor(active ? TFT_CYAN : (isGrave ? tft.color565(230, 170, 70) : TFT_WHITE));
+    tft.drawString(String(CAL_LABELS[i]), 54, ry + 10);
+
+    if (calDone[i]) {
+      tft.setTextColor(TFT_GREEN);
+      tft.drawString(calValue[i], 165, ry + 10);
+    } else {
+      tft.setTextColor(tft.color565(120, 120, 130));
+      if (active)        tft.drawString("<-- capture this one", 165, ry + 10);
+      else if (i == 4)   tft.drawString("optional: taken WHITE pieces", 165, ry + 10);
+      else if (i == 5)   tft.drawString("optional: taken BLACK pieces", 165, ry + 10);
+      else               tft.drawString("not captured", 165, ry + 10);
+    }
+  }
+
+  // --- buttons ---
+  tft.fillRoundRect(565, 140, 195, 70, 10,
+                    calBusy ? tft.color565(60, 60, 60) : tft.color565(40, 140, 60));
+  tft.drawRoundRect(565, 140, 195, 70, 10, TFT_WHITE);
+  tft.setTextSize(3);
+  tft.setTextColor(calBusy ? tft.color565(120, 120, 120) : TFT_WHITE);
+  tft.drawCenterString(calBusy ? "WAIT" : "CAPTURE", 662, 162);
+
+  tft.fillRoundRect(565, 225, 195, 55, 10, tft.color565(60, 65, 80));
+  tft.drawRoundRect(565, 225, 195, 55, 10, TFT_WHITE);
+  tft.setTextSize(2);
+  tft.drawCenterString("NEXT CORNER", 662, 243);
+
+  bool all = calDone[0] && calDone[1] && calDone[2] && calDone[3];   // gy optional
+  tft.fillRoundRect(565, 295, 195, 60, 10,
+                    all ? tft.color565(210, 130, 20) : tft.color565(55, 55, 60));
+  tft.drawRoundRect(565, 295, 195, 60, 10, TFT_WHITE);
+  tft.setTextSize(3);
+  tft.setTextColor(all ? TFT_WHITE : tft.color565(110, 110, 115));
+  tft.drawCenterString("SAVE", 662, 313);
+
+  tft.fillRoundRect(565, 370, 195, 50, 10, tft.color565(110, 35, 35));
+  tft.drawRoundRect(565, 370, 195, 50, 10, TFT_WHITE);
+  tft.setTextSize(2);
+  tft.setTextColor(TFT_WHITE);
+  tft.drawCenterString("BACK", 662, 386);
+
+  // --- status line ---
+  tft.setTextSize(2);
+  tft.setTextColor(TFT_YELLOW);
+  tft.drawString(calMessage, 40, 385);
+}
+
+void handleTouchCalibration(int x, int y) {
+  // CAPTURE  (locked until the host answers, so a double-tap can't fire twice)
+  if (x >= 565 && x <= 760 && y >= 140 && y <= 210) {
+    if (calBusy) return;
+    calBusy = true;
+    Serial.println("CAL_CAPTURE:" + String(CAL_CORNERS[calIndex]));
+    calMessage = "Reading arm position...";
+    drawCalibrationScreen();
+    delay(600);                    // physically outlast a bouncing finger
+    return;
+  }
+
+  // NEXT CORNER
+  if (x >= 565 && x <= 760 && y >= 225 && y <= 280) {
+    calIndex = (calIndex + 1) % CAL_N;
+    calMessage = "Now do " + String(CAL_LABELS[calIndex]);
+    drawCalibrationScreen();
+    return;
+  }
+
+  // SAVE
+  if (x >= 565 && x <= 760 && y >= 295 && y <= 355) {
+    if (calDone[0] && calDone[1] && calDone[2] && calDone[3]) {
+      Serial.println("CAL_SAVE");
+      calMessage = "Saving...";
+    } else {
+      calMessage = "Capture all four corners first!";
+    }
+    drawCalibrationScreen();
+    return;
+  }
+
+  // BACK
+  if (x >= 565 && x <= 760 && y >= 370 && y <= 420) {
+    Serial.println("CAL_EXIT");
+    currentState = START_SCREEN;
+    drawStartScreen();
+    return;
+  }
+
+  // tapping a row selects that corner
+  for (int i = 0; i < CAL_N; i++) {
+    int ry = 128 + i * 42;
+    if (x >= 40 && x <= 540 && y >= ry && y <= ry + 36) {
+      calIndex = i;
+      calMessage = "Now do " + String(CAL_LABELS[i]);
+      drawCalibrationScreen();
+      return;
+    }
+  }
+}
