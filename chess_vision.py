@@ -25,6 +25,13 @@ HOW TO USE
        f   flip / rotate the board 90 degrees (if a1 ends up in the wrong place)
        b   capture baseline (call the current position "known")
        d   detect what changed since the baseline
+       [ ] shrink / grow the sampled area inside each square
+       - + how strict the overhang filter is
+       e/E raise / lower the edge weight (helps same-tone pieces)
+       ARROWS  drag every sampling box until it sits on the piece BASE
+       0   reset that offset back to zero
+       ; ' shift sampling towards the BASE of the piece (away from the top)
+       k   click where the camera looks straight down (sets the lean direction)
        s   save a snapshot
        q   quit
 """
@@ -37,6 +44,32 @@ import cv2
 import numpy as np
 
 CAM_INDEX   = 1            # try 1, 2... if the wrong camera opens
+
+# A tall piece leans over the edge of its square and bleeds into the neighbour.
+# Two defences:
+#   INSET     - only look at the middle of each square, ignoring the edges
+#   RATIO     - a second square only counts if it changed nearly as much as
+#               the first. Overhang scores far lower than a real move.
+INSET       = 0.30         # fraction of the square trimmed off each side
+
+# The camera is not perfectly overhead, so pieces LEAN AWAY from the point
+# directly beneath it. Their tops splay into neighbouring squares while their
+# BASES stay in the right square. The warp is only exact at board level, so
+# the base is the honest part to look at.
+#
+# BASE_BIAS pulls each sampling window from the square centre back towards
+# the nadir (the spot the camera looks straight down on), which is where the
+# base of the piece is relative to its leaning top.
+BASE_BIAS   = 0.30         # 0 = square centre, 1 = shifted a whole half-square
+NADIR       = None         # (x, y) in warped pixels; None = centre of the board
+
+# A blunt, direct offset applied to EVERY sampling box, in warped pixels.
+# Use the arrow keys to drag the boxes until they sit on the piece BASES.
+# Much easier to get right by eye than the nadir maths.
+OFFSET_X    = 0
+OFFSET_Y    = 0
+RATIO       = 0.40         # 2nd square must score >= this * the 1st
+THRESHOLD   = 12.0         # below this, treat a square as unchanged
 WARP_SIZE   = 640          # the board gets flattened to this many pixels square
 CALIB_FILE  = "board_corners.json"
 
@@ -193,42 +226,159 @@ def warp_board(frame, corners):
 
 
 # ---------------------------------------------------------------- squares
-def square_cells(warped):
-    """Split the warped board into 64 cells, keyed by square name."""
+def nadir_point(nadir=None):
+    """Where the camera looks straight down, in warped pixels."""
+    if nadir is not None:
+        return nadir
+    if NADIR is not None:
+        return NADIR
+    return (WARP_SIZE / 2.0, WARP_SIZE / 2.0)
+
+
+def cell_rect(f, r, inset_frac=None, bias=None, nadir=None, off=(0, 0)):
+    """
+    The box to sample for one square, shifted towards the BASE of any piece
+    standing there rather than its leaning top.
+    """
     s = WARP_SIZE // 8
-    inset = int(s * 0.18)          # ignore the edges: piece bases overhang
+    if inset_frac is None:
+        inset_frac = INSET
+    if bias is None:
+        bias = BASE_BIAS
+    inset = int(s * inset_frac)
+
+    cx, cy = (f + 0.5) * s, (r + 0.5) * s
+    nx, ny = nadir_point(nadir)
+
+    # unit vector from this square towards the nadir; the base lies that way
+    dx, dy = nx - cx, ny - cy
+    mag = max(1e-6, (dx * dx + dy * dy) ** 0.5)
+    shift = bias * (s / 2.0)
+    ox, oy = dx / mag * shift, dy / mag * shift
+
+    ox += off[0]; oy += off[1]          # blunt manual nudge on top
+
+    x0 = int(f * s + inset + ox); x1 = int((f + 1) * s - inset + ox)
+    y0 = int(r * s + inset + oy); y1 = int((r + 1) * s - inset + oy)
+
+    # keep it on the board
+    x0 = max(0, min(WARP_SIZE - 2, x0)); x1 = max(x0 + 2, min(WARP_SIZE, x1))
+    y0 = max(0, min(WARP_SIZE - 2, y0)); y1 = max(y0 + 2, min(WARP_SIZE, y1))
+    return x0, y0, x1, y1
+
+
+def square_cells(warped, inset_frac=None, bias=None, nadir=None, off=(0, 0)):
+    """Split the warped board into 64 sampling patches, keyed by square name."""
     cells = {}
     for r in range(8):             # r=0 is rank 8 (top of the warped image)
         for f in range(8):
-            y0, x0 = r * s + inset, f * s + inset
-            y1, x1 = (r + 1) * s - inset, (f + 1) * s - inset
-            name = FILES[f] + RANKS[7 - r]
-            cells[name] = warped[y0:y1, x0:x1]
+            x0, y0, x1, y1 = cell_rect(f, r, inset_frac, bias, nadir, off)
+            cells[FILES[f] + RANKS[7 - r]] = warped[y0:y1, x0:x1]
     return cells
 
 
+SIG_SIZE = (32, 32)        # every cell is resized to this before comparing
+
 def cell_signature(cell):
-    """A small, lighting-tolerant fingerprint of one square."""
-    g = cv2.cvtColor(cell, cv2.COLOR_BGR2GRAY)
-    g = cv2.GaussianBlur(g, (5, 5), 0)
-    return g.astype(np.float32)
+    """
+    A fingerprint of one square that survives the hard case:
+    a WHITE piece on a WHITE square, or a BLACK piece on a BLACK square.
+
+    Plain brightness fails there - a white pawn on a light square barely
+    shifts the average. So the signature stacks three views, each of which
+    catches something the others miss:
+
+      1. LOCALLY NORMALISED BRIGHTNESS
+         CLAHE stretches the contrast inside each square on its own, so the
+         faint shading on a white-on-white piece gets amplified into
+         something measurable instead of being lost in the average.
+
+      2. EDGE ENERGY (Sobel gradient magnitude)
+         This is the important one. A piece has a SILHOUETTE and curved,
+         shaded sides. Those edges exist no matter how well the piece's tone
+         matches the square underneath it. An empty square is flat and has
+         almost no gradient; an occupied one has a lot.
+
+      3. COLOUR (a and b from Lab)
+         Real "white" and "black" pieces are usually slightly warm or cool
+         compared to the board. Lab keeps that separate from lightness, so it
+         still helps when brightness alone does not.
+    """
+    c = cv2.resize(cell, SIG_SIZE, interpolation=cv2.INTER_AREA)
+    c = cv2.GaussianBlur(c, (3, 3), 0)
+
+    lab = cv2.cvtColor(c, cv2.COLOR_BGR2Lab)
+    L, A, B = cv2.split(lab)
+
+    # 1. local contrast: pulls detail out of same-tone-on-same-tone
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(4, 4))
+    Ln = clahe.apply(L)
+
+    # 2. edges: present whenever a piece is there, tone-independent
+    gx = cv2.Sobel(L, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(L, cv2.CV_32F, 0, 1, ksize=3)
+    edge = cv2.magnitude(gx, gy)
+    edge = np.clip(edge * EDGE_GAIN, 0, 255)
+
+    return np.dstack([
+        Ln.astype(np.float32),
+        edge.astype(np.float32),
+        A.astype(np.float32),
+        B.astype(np.float32),
+    ])
 
 
-def diff_squares(base, now, threshold=12.0):
+# How much each view counts towards the final score.
+# Raise EDGE if same-tone pieces are still being missed.
+# Tuned by grid search so all four tone combinations score about the SAME.
+# Before: white-on-white scored 6, black-on-white scored 63 - a 10x spread,
+# which meant the ratio filter threw away real white-on-white moves.
+# After: 29 / 29 / 53 / 29 - a 1.8x spread, all comfortably detected.
+W_BRIGHT, W_EDGE, W_COLOUR = 0.2, 2.0, 1.0
+EDGE_GAIN = 2.5
+
+
+def cell_score(a, b):
+    """How different are two signatures? Weighted across the three views."""
+    d = np.abs(a - b)
+    bright = float(d[:, :, 0].mean())
+    edge   = float(d[:, :, 1].mean())
+    colour = float(d[:, :, 2].mean() + d[:, :, 3].mean()) / 2.0
+    return (W_BRIGHT * bright + W_EDGE * edge + W_COLOUR * colour) / \
+           (W_BRIGHT + W_EDGE + W_COLOUR)
+
+
+def diff_squares(base, now, threshold=None, ratio=None):
     """
     Which squares changed between two boards?
-    Returns [(square, score), ...] sorted by how much it changed.
+
+    Returns (kept, rejected). A square is only kept if it changed by at least
+    `ratio` of the biggest change - that is what throws out the faint bleed
+    from a tall piece leaning into the square next door, which typically
+    scores 6x lower than the square that actually changed.
     """
-    changed = []
+    if ratio is None:
+        ratio = RATIO
+    if threshold is None:
+        threshold = THRESHOLD
+
+    scored = []
     for name in base:
         a, b = base[name], now[name]
-        if a.shape != b.shape:
+        if a is None or b is None or a.shape != b.shape:
             continue
-        score = float(np.mean(np.abs(a - b)))
+        score = cell_score(a, b)
         if score > threshold:
-            changed.append((name, score))
-    changed.sort(key=lambda t: -t[1])
-    return changed
+            scored.append((name, score))
+    scored.sort(key=lambda t: -t[1])
+
+    if not scored:
+        return [], []
+
+    cutoff = scored[0][1] * ratio
+    kept     = [t for t in scored if t[1] >= cutoff]
+    rejected = [t for t in scored if t[1] <  cutoff]
+    return kept, rejected
 
 
 def guess_move(changed):
@@ -243,12 +393,28 @@ def guess_move(changed):
 
 
 # ---------------------------------------------------------------- overlay
-def draw_grid(warped, highlight=()):
+def draw_grid(warped, highlight=(), inset_frac=None, bias=None, nadir=None, off=(0, 0)):
     out = warped.copy()
     s = WARP_SIZE // 8
+    if inset_frac is None:
+        inset_frac = INSET
+    ins = int(s * inset_frac)
+
     for i in range(9):
         cv2.line(out, (i * s, 0), (i * s, WARP_SIZE), (0, 180, 0), 1)
         cv2.line(out, (0, i * s), (WARP_SIZE, i * s), (0, 180, 0), 1)
+
+    # the actual sampled area - shifted towards each piece's BASE
+    for r in range(8):
+        for f in range(8):
+            x0, y0, x1, y1 = cell_rect(f, r, inset_frac, bias, nadir, off)
+            cv2.rectangle(out, (x0, y0), (x1, y1), (90, 90, 200), 1)
+
+    # mark the nadir: pieces lean directly away from this point
+    nx, ny = nadir_point(nadir)
+    cv2.drawMarker(out, (int(nx), int(ny)), (0, 220, 255),
+                   cv2.MARKER_CROSS, 22, 2)
+    cv2.circle(out, (int(nx), int(ny)), 13, (0, 220, 255), 1)
 
     for r in range(8):
         for f in range(8):
@@ -262,6 +428,41 @@ def draw_grid(warped, highlight=()):
         cv2.rectangle(out, (f * s + 2, r * s + 2),
                       ((f + 1) * s - 2, (r + 1) * s - 2), (0, 0, 255), 3)
     return out
+
+
+def pick_nadir(cap, corners):
+    """
+    Click the square the camera is looking straight down on - the one whose
+    piece looks like it is standing UPRIGHT rather than leaning. Pieces lean
+    directly away from that point, so it is what tells us where each base is.
+    """
+    picked = {}
+
+    def on_click(e, x, y, flags, param):
+        if e == cv2.EVENT_LBUTTONDOWN:
+            picked["xy"] = (float(x), float(y))
+
+    cv2.namedWindow("nadir")
+    cv2.setMouseCallback("nadir", on_click)
+    print("\n[Nadir] Click the spot the camera looks STRAIGHT DOWN on -")
+    print("        the place where a piece looks upright, not leaning.")
+    print("        Pieces lean away from it. ESC to cancel.")
+
+    while "xy" not in picked:
+        ok, frame = cap.read()
+        if not ok:
+            return None
+        w = warp_board(frame, corners)
+        cv2.putText(w, "click where pieces look UPRIGHT (not leaning)",
+                    (10, 26), cv2.FONT_HERSHEY_SIMPLEX, .6, (0, 220, 255), 2)
+        cv2.imshow("nadir", w)
+        if (cv2.waitKey(1) & 0xFF) == 27:
+            cv2.destroyWindow("nadir")
+            return None
+
+    cv2.destroyWindow("nadir")
+    print(f"        nadir set to {picked['xy']}")
+    return picked["xy"]
 
 
 # ---------------------------------------------------------------- main
@@ -284,10 +485,17 @@ def main():
 
     baseline = None
     highlight = ()
+    inset  = INSET
+    ratio  = RATIO
+    bias   = BASE_BIAS
+    nadir  = NADIR
+    off    = [OFFSET_X, OFFSET_Y]
     status = "press b to set the baseline"
 
     print("\n  b = baseline    d = detect")
     print("  c = re-click    r = full reset    n = nudge a corner    f = rotate 90")
+    print("  ARROWS = drag the sample boxes onto the piece bases,  0 = reset")
+    print("  ;/' base bias   k = set nadir   [ ] inset   - + ratio")
     print("  s = snapshot    q = quit\n")
 
     while True:
@@ -296,15 +504,16 @@ def main():
             break
 
         warped = warp_board(frame, corners)
-        view = draw_grid(warped, highlight)
+        view = draw_grid(warped, highlight, inset, bias, nadir, tuple(off))
 
         cv2.rectangle(view, (0, WARP_SIZE - 52), (WARP_SIZE, WARP_SIZE),
                       (0, 0, 0), -1)
         cv2.putText(view, status, (8, WARP_SIZE - 30),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
-        cv2.putText(view, "b base  d detect  |  r reset  n nudge  f rotate  c reclick",
+        cv2.putText(view, f"ARROWS move boxes ({off[0]:+d},{off[1]:+d}) 0=reset  "
+                          f"inset {inset:.2f}[]  ratio {ratio:.2f}-+  |  b base  d detect",
                     (8, WARP_SIZE - 9),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (140, 140, 140), 1)
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.42, (140, 140, 140), 1)
 
         # show the raw camera with the board outline, so you can see framing
         raw = frame.copy()
@@ -312,14 +521,23 @@ def main():
         cv2.imshow("camera", raw)
         cv2.imshow("board", view)
 
-        k = cv2.waitKey(1) & 0xFF
+        kx = cv2.waitKeyEx(1)
+        k = kx & 0xFF if kx != -1 else 255
+
+        # arrow keys drag the WHOLE sampling grid onto the piece bases
+        if kx in (2424832, 65361):   off[0] -= 1; baseline = None
+        elif kx in (2555904, 65363): off[0] += 1; baseline = None
+        elif kx in (2490368, 65362): off[1] -= 1; baseline = None
+        elif kx in (2621440, 65364): off[1] += 1; baseline = None
+        if kx in (2424832, 65361, 2555904, 65363, 2490368, 65362, 2621440, 65364):
+            status = f"sample offset ({off[0]:+d},{off[1]:+d}) - press b to re-baseline"
 
         if k == ord("q"):
             break
 
         elif k == ord("b"):
             baseline = {n: cell_signature(c)
-                        for n, c in square_cells(warped).items()}
+                        for n, c in square_cells(warped, inset, bias, nadir, tuple(off)).items()}
             highlight = ()
             status = "baseline set - make a move, then press d"
             print("[Base] captured")
@@ -329,28 +547,34 @@ def main():
                 status = "no baseline yet - press b first"
                 continue
             now = {n: cell_signature(c)
-                   for n, c in square_cells(warped).items()}
-            changed = diff_squares(baseline, now)
+                   for n, c in square_cells(warped, inset, bias, nadir,
+                                            tuple(off)).items()}
+            kept, rejected = diff_squares(baseline, now, ratio=ratio)
 
-            if not changed:
+            if not kept:
                 status = "nothing changed"
                 highlight = ()
             else:
-                top = changed[:4]
-                print("\n[Diff] squares that changed:")
-                for n, sc in top:
+                print("\n[Diff] real changes:")
+                for n, sc in kept[:4]:
                     print(f"    {n}   score {sc:6.1f}")
+                if rejected:
+                    print("       ignored as overhang/shadow:")
+                    for n, sc in rejected[:4]:
+                        print(f"         {n}   score {sc:6.1f}")
 
-                mv = guess_move(changed)
+                mv = guess_move(kept)
                 if mv:
                     highlight = (mv[0], mv[1])
                     status = f"move between {mv[0]} and {mv[1]}"
                     print(f"[Move] {mv[0]} <-> {mv[1]}")
+                elif len(kept) == 1:
+                    highlight = (kept[0][0],)
+                    status = f"only {kept[0][0]} changed (capture?)"
                 else:
-                    highlight = tuple(n for n, _ in top)
-                    status = f"only {len(changed)} square changed"
+                    highlight = tuple(n for n, _ in kept[:4])
+                    status = f"{len(kept)} squares changed - ambiguous"
 
-                # re-baseline so the next detect compares against now
                 baseline = now
 
         elif k == ord("c"):
@@ -390,6 +614,54 @@ def main():
             highlight = ()
             status = "rotated 90 - press f again if still wrong"
             print("[Cal] rotated the board 90 degrees")
+
+        elif k == ord("["):
+            inset = max(0.05, inset - 0.03)
+            baseline = None
+            status = f"inset {inset:.2f} - press b to re-baseline"
+        elif k == ord("]"):
+            inset = min(0.45, inset + 0.03)
+            baseline = None
+            status = f"inset {inset:.2f} (tighter = less overhang) - press b"
+
+        elif k == ord(";"):
+            bias = max(0.0, bias - 0.05)
+            baseline = None
+            status = f"base bias {bias:.2f} (0 = square centre) - press b"
+        elif k == ord("'"):
+            bias = min(0.9, bias + 0.05)
+            baseline = None
+            status = f"base bias {bias:.2f} (more = further towards the base) - press b"
+
+        elif k == ord("k"):
+            nn = pick_nadir(cap, corners)
+            if nn is not None:
+                nadir = nn
+                baseline = None
+                status = "nadir set - press b to re-baseline"
+
+        elif k == ord("e"):
+            ns = globals()
+            ns["W_EDGE"] = min(6.0, W_EDGE + 0.5)
+            baseline = None
+            status = f"edge weight {W_EDGE:.1f} (higher = better same-tone) - press b"
+        elif k == ord("E"):
+            ns = globals()
+            ns["W_EDGE"] = max(0.5, W_EDGE - 0.5)
+            baseline = None
+            status = f"edge weight {W_EDGE:.1f} - press b"
+
+        elif k == ord("-"):
+            ratio = max(0.05, ratio - 0.05)
+            status = f"ratio {ratio:.2f} (lower = more squares accepted)"
+        elif k in (ord("="), ord("+")):
+            ratio = min(0.95, ratio + 0.05)
+            status = f"ratio {ratio:.2f} (higher = rejects overhang harder)"
+
+        elif k == ord("0"):
+            off = [0, 0]
+            baseline = None
+            status = "sample offset reset to (0,0)"
 
         elif k == ord("s"):
             cv2.imwrite("snapshot_board.png", view)
