@@ -66,6 +66,18 @@ THINK_TIME     = 0.5
 # by default so the arm stays parked until there is a real move to play; the
 # ARM TEST button on the touchscreen still runs it whenever you want it.
 SELFTEST_AT_START = False
+# The arm's workspace is a SHELL, not a cylinder: up in the travel lane it
+# cannot fold in as close to its base - nor stretch as far out - as it can
+# down at board height. A square just inside that limit is reachable at PIECE
+# height but NOT in the lane above it, and the arm simply stops short and
+# trips its alarm. These are the lane's limits, in mm from the base. Leave
+# them None and they are learned (and printed) the first time a move stops
+# short; paste the printed numbers here to skip that one learning move.
+# 184 is what YOUR arm measured: asked for a point 148mm from its base at
+# travel height it stopped at 181. Set it back to None to measure again (the
+# first far-rank move of the session then costs one wasted reach).
+LANE_MIN_R = 184.0       # closest the arm folds in up in the travel lane
+LANE_MAX_R = None        # furthest it reaches out up there (None = learn it)
 # Where the arm parks (high, clear) before the camera reads the board. Set it
 # yourself on the ARM calibration screen (HIGH PARK row); that writes PARK into
 # board_config.py. This is just the fallback if you haven't set one.
@@ -256,6 +268,9 @@ _last = [999.0, 999.0, 999.0]      # last known position; 999 = unknown
 # rather than letting good moves be reported as failures.
 VERIFY_TOL  = 5.0                  # mm: closer than this counts as on target
 CORRECT_MAX = 30.0                 # mm: nudge back on target up to this much
+HOVER       = 20.0                 # mm above the grip point: the height the
+                                   # claw slides in at when it has to come in
+                                   # along a file (see "the two operations")
 
 def _wait_queue(expected_idx, timeout):
     """Block until the arm reports it executed command `expected_idx`."""
@@ -312,21 +327,41 @@ def _miss(x, y, z):
     _last[0], _last[1], _last[2] = pos
     return math.dist(pos, (x, y, z))
 
+_last_fail = {"reason": None}      # why the last _goto returned False
+
 def _goto(x, y, z, label="", nudge=True):
     """
     Send the arm to ONE absolute point and confirm it got there.
     Returns True if the arm is within tolerance of (x, y, z).
     """
+    start = (_last[0], _last[1], _last[2]) if _last[0] < 900 else None
+    _last_fail["reason"] = None
     try:
         _send_move(x, y, z)
     except Exception as e:
         print(f"  [Move] {label} command failed: {e}")
         clear_alarms()
+        _last_fail["reason"] = "command"
         return False
 
     off = _miss(x, y, z)
     if off is None or off <= VERIFY_TOL:
         return True
+
+    # Did the arm travel, but stop at a different distance from its base? Then
+    # it went as far along the line as its workspace allows: that is the reach
+    # limit at this height, not a hiccup. Nudging and clearing alarms cannot
+    # conjure reach, so give up on the point at once and let the caller find
+    # another way in. (An arm that did NOT move was ignoring the command -
+    # that IS worth a retry, so it falls through below.)
+    moved = math.dist(start, (_last[0], _last[1], _last[2])) if start else 999.0
+    r_want, r_got = math.hypot(x, y), math.hypot(_last[0], _last[1])
+    if moved > 2.0 and abs(r_got - r_want) > VERIFY_TOL:
+        print(f"  [Move] {label}: stopped {r_got:.0f}mm from the base, asked "
+              f"for {r_want:.0f}mm - the arm cannot reach that far "
+              f"{'in' if r_got > r_want else 'out'} at z={z:.0f}")
+        _last_fail["reason"] = "reach"
+        return False
 
     if nudge and off <= CORRECT_MAX:
         print(f"  [Move] {label}: {off:.1f}mm off - nudging onto target")
@@ -356,12 +391,14 @@ def _goto(x, y, z, label="", nudge=True):
 
     print(f"  [Move] {label}: asked ({x:.1f},{y:.1f},{z:.1f}) but arm is at "
           f"({_last[0]:.1f},{_last[1]:.1f},{_last[2]:.1f}) - off {off:.1f}mm")
+    _last_fail["reason"] = "off_target"
     return False
 
 # ---- board-derived heights -------------------------------------------------
 _BOARD_TOP_Z = 0.0
 TRAVEL_Z     = TRAVEL_Z_FLOOR
 PITCH        = 25.0
+FILE_AXIS    = (1.0, 0.0)
 
 def _recompute_geometry():
     """
@@ -370,12 +407,31 @@ def _recompute_geometry():
     again after anything rewrites board_config, so a fresh calibration can
     never leave a stale travel height (or pitch) behind.
     """
-    global _BOARD_TOP_Z, TRAVEL_Z, PITCH
+    global _BOARD_TOP_Z, TRAVEL_Z, PITCH, FILE_AXIS
     _BOARD_TOP_Z = max(sq["p"]["z"] for sq in board_config.SQUARE_MAP.values())
     TRAVEL_Z = max(_BOARD_TOP_Z + CLEARANCE, TRAVEL_Z_FLOOR)
     if FLOOR_Z is not None:
         TRAVEL_Z = max(TRAVEL_Z, FLOOR_Z + FLOOR_MARGIN)
     PITCH = _board_pitch()
+    FILE_AXIS = _file_axis()
+
+def _file_axis():
+    """
+    Unit vector along a FILE of the board (rank 8 -> rank 1), measured from
+    the saved calibration. Sliding into a square along its own file is what
+    lets pieces on that file pass BETWEEN the open fingers instead of being
+    knocked over.
+    """
+    try:
+        g = lambda sq: board_config.SQUARE_MAP[sq]["p"]
+        vx = ((g("a1")["x"] - g("a8")["x"]) + (g("h1")["x"] - g("h8")["x"])) / 2.0
+        vy = ((g("a1")["y"] - g("a8")["y"]) + (g("h1")["y"] - g("h8")["y"])) / 2.0
+        n = math.hypot(vx, vy)
+        if n > 1.0:
+            return vx / n, vy / n
+    except Exception:
+        pass
+    return 1.0, 0.0        # fall back to straight out from the arm's base
 
 _recompute_geometry()
 print(f"[Motion] travel height {TRAVEL_Z:.1f} mm")
@@ -422,80 +478,170 @@ def reach_ok(x, y):
 # One square = one trip: UP into the travel lane, ACROSS to the square, DOWN,
 # act, UP again. Three moves, nothing in between.
 #
-# What used to be here, and why it is gone: every pick and every place first
-# flew to the MIDDLE of the board, and the pick then dipped down there and
-# crawled out to the square in two more moves. That mid-board detour bought
-# nothing - the travel lane is already CLEARANCE above the tallest piece, so
-# crossing it directly clears everything, and the final descent sweeps the
-# target square's own column either way. It only cost about six extra moves
-# (and several seconds) per piece, and the dip actually flew at PIECE height
-# across the middle of the board, which is where a knock comes from. The
-# separate "hover" stop above the square is gone for the same reason: it sat
-# on the same vertical line as the descent that followed it, so it verified
-# nothing the travel-height arrival had not already verified.
+# The one thing that complicates it is the arm's reach. Its workspace is a
+# SHELL, not a cylinder: up in the travel lane it cannot fold in as close to
+# its base - nor stretch as far out - as it can down at board height. The rank
+# nearest the base sits right on that limit, so those squares are reachable at
+# PIECE height but not in the lane above them: the arm stops short and trips
+# the alarm, which looks like it wandering out over the board and coming back.
+#
+# So for a square the lane cannot reach, the arm goes as far along that
+# square's OWN FILE as the lane does reach, drops to HOVER above the pieces
+# there, and slides in along the file - pieces on the file pass between the
+# open fingers. It backs out the same way before it rises. Every other square
+# is still the straight three moves, and nothing ever detours via the middle
+# of the board.
+
+LANE_R = {"min": LANE_MIN_R, "max": LANE_MAX_R}
+
+def _at_radius(x, y, r):
+    """The point at radius r straight out from the base through (x, y)."""
+    d = math.hypot(x, y) or 1.0
+    return x * r / d, y * r / d
+
+def _along_file_to_radius(x, y, want_r):
+    """
+    Walk along the square's file until the radius from the base reaches
+    want_r, and return that point. (Solves |P + t*A| = want_r for the smaller
+    |t|.) If the file never reaches that radius, fall back to the point
+    straight out from the base.
+    """
+    ax, ay = FILE_AXIS
+    b = x * ax + y * ay
+    c = x * x + y * y - want_r * want_r
+    disc = b * b - c
+    if disc < 0:
+        return _at_radius(x, y, want_r)
+    root = math.sqrt(disc)
+    t = min((-b + root, -b - root), key=abs)
+    return x + t * ax, y + t * ay
+
+def lane_point(x, y):
+    """
+    Where the arm sits in the TRAVEL LANE when it is working on (x, y): the
+    square itself when the lane reaches it, otherwise the nearest point along
+    its file that the lane does reach.
+    """
+    r = math.hypot(x, y)
+    if LANE_R["min"] is not None and r < LANE_R["min"] - 0.5:
+        return _along_file_to_radius(x, y, LANE_R["min"])
+    if LANE_R["max"] is not None and r > LANE_R["max"] + 0.5:
+        return _along_file_to_radius(x, y, LANE_R["max"])
+    return x, y
+
+def _learn_lane_limit(want_x, want_y):
+    """
+    A lane move stopped short. If the arm ended at a different RADIUS than it
+    was asked for, that radius is the lane's reach limit - remember it, so
+    from now on the arm comes in along the file instead of failing first.
+    Returns True if a limit was learned.
+    """
+    want_r = math.hypot(want_x, want_y)
+    got_r = math.hypot(_last[0], _last[1])
+    if got_r > want_r + VERIFY_TOL and got_r < MAX_REACH:
+        LANE_R["min"] = got_r + 3.0
+        print(f"  [Reach] up in the travel lane the arm folds in no closer "
+              f"than {LANE_R['min']:.0f}mm, so it will come in along the file."
+              f" Put LANE_MIN_R = {LANE_R['min']:.0f} in CONFIG to skip this.")
+        return True
+    if got_r < want_r - VERIFY_TOL and got_r > MIN_GRAB:
+        LANE_R["max"] = got_r - 3.0
+        print(f"  [Reach] up in the travel lane the arm reaches out no further"
+              f" than {LANE_R['max']:.0f}mm, so it will come in along the file."
+              f" Put LANE_MAX_R = {LANE_R['max']:.0f} in CONFIG to skip this.")
+        return True
+    return False
 
 def travel_to(x, y, label=""):
     """
     Rise into the travel lane, then cross to (x, y) - still up high.
 
     If the straight line is refused, go again in two shorter linear hops
-    through the halfway point. A Dobot will not always interpolate one long
-    MOVL right across its workspace: it stops part-way and trips the alarm,
-    which looks exactly like the arm wandering out and coming back. Both ends
-    of the hop are at travel height, so the halfway point is too - there is
-    nothing up there to hit.
+    through the halfway point: a Dobot will not always interpolate one long
+    MOVL right across its workspace. Both ends of the hop are at travel
+    height, so the halfway point is too - there is nothing up there to hit.
     """
     name = label or "travel"
     lift(f"lift before {name}")
     if _goto(x, y, TRAVEL_Z, f"over {name}"):
         return True
+    if _last_fail["reason"] == "reach":
+        return False           # splitting the line does not buy any reach
     mx, my = (_last[0] + x) / 2.0, (_last[1] + y) / 2.0
     print(f"  [Move] straight line to {name} refused - going via the halfway "
           f"point ({mx:.1f}, {my:.1f})")
     _goto(mx, my, TRAVEL_Z, "halfway")
     return _goto(x, y, TRAVEL_Z, f"over {name}")
 
+def approach(x, y, z, square="?"):
+    """
+    Bring the claw down onto (x, y, z), whichever way the arm's reach allows.
+    Returns True only if it actually arrived.
+    """
+    lx, ly = lane_point(x, y)
+    if not travel_to(lx, ly, square):
+        if _learn_lane_limit(lx, ly):
+            clear_alarms()                     # the short stop will have tripped it
+            time.sleep(0.2)
+            lx, ly = lane_point(x, y)          # limits changed - new entry point
+            if not travel_to(lx, ly, square):
+                return False
+        elif math.dist((_last[0], _last[1]), (lx, ly)) > PITCH / 2.0:
+            print(f"  [Reach] {square}: the arm stopped more than half a square"
+                  f" from where it should be. Is the RED alarm light on?")
+            return False
+    if math.dist((lx, ly), (x, y)) > 0.5:      # coming in along the file
+        if not _goto(lx, ly, z + HOVER, f"down on {square}'s file"):
+            return False
+        if not _goto(x, y, z + HOVER, f"in along the file to {square}"):
+            return False
+        return _goto(x, y, z, f"down onto {square}")
+    return _goto(x, y, z, f"down onto {square}")
+
+def retreat(square="?"):
+    """
+    Leave the square the arm is standing on and rise into the travel lane -
+    the exact reverse of approach(), so a square that had to be entered along
+    its file is left along it too (the arm cannot lift straight out of one).
+    """
+    if _last[0] > 900:
+        return
+    x, y, z = _last[0], _last[1], _last[2]
+    lx, ly = lane_point(x, y)
+    if math.dist((lx, ly), (x, y)) > 0.5:
+        _goto(x, y, z + HOVER, f"lift clear of {square}")
+        _goto(lx, ly, _last[2], f"back out along {square}'s file")
+    _goto(lx, ly, TRAVEL_Z, f"lift from {square}")
+
 def pick(x, y, z, square="?"):
-    """Open the claw, cross to the square, descend, close on the piece, lift."""
+    """Open the claw, get to the square, close on the piece, come away."""
     print(f"  [Pick] {square} at ({x:.1f}, {y:.1f}, {z:.1f})")
     claw_open()                                   # opens while it travels
-    if not travel_to(x, y, square):
-        # A few mm out is normal and the descent re-commands X and Y anyway,
-        # so carry on. Only give up if the arm is so far off that it is over a
-        # DIFFERENT square - descending there would hit the wrong piece.
-        off = math.hypot(_last[0] - x, _last[1] - y)
-        print(f"  [Pick] {square}: arrival {off:.1f}mm off target")
-        if off > PITCH / 2.0:
-            print(f"  [Pick] {square}: that is more than half a square - not "
-                  f"descending. Is the RED alarm light on, or the square out "
-                  f"of reach?")
-            return False
-    if not _goto(x, y, z, f"down onto {square}"):
-        print(f"  [Pick] {square}: not at the piece - not grabbing "
-              f"(see the [Move] line above for where it actually stopped)")
-        _goto(x, y, TRAVEL_Z, "retreat")
+    if not approach(x, y, z, square):
+        print(f"  [Pick] {square}: could not get to the piece - not grabbing "
+              f"(the [Move] line above says where the arm actually stopped)")
+        retreat(square)
         return False
     time.sleep(SETTLE)
     claw_close()
-    _goto(x, y, TRAVEL_Z, f"lift from {square}")
+    retreat(square)
     return True
 
 def place(x, y, z, square="?"):
-    """Carrying a piece: cross to the square, lower it in, release, lift."""
+    """Carrying a piece: get to the square, lower it in, release, come away."""
     print(f"  [Place] {square} at ({x:.1f}, {y:.1f}, {z:.1f})")
-    # Unlike pick, this one carries a piece: even a poor arrival is worth
-    # finishing, because the alternative is holding the piece in mid-air.
-    if not travel_to(x, y, square):
-        print(f"  [Place] {square}: arrival not confirmed - putting it down anyway")
-    if not _goto(x, y, z, f"down onto {square}"):
-        # Releasing here is still better than carrying the piece around, but
-        # say so: the piece may not be centred on the square.
-        print(f"  [Place] {square}: descent ended off target - releasing anyway")
+    ok = approach(x, y, z, square)
+    if not ok:
+        # Holding on is no better - the next move would open the claw over
+        # some other square - so let it go here and say exactly where.
+        print(f"  [Place] {square}: could not get there. Releasing at "
+              f"({_last[0]:.1f}, {_last[1]:.1f}) - put the piece on {square} "
+              f"by hand.")
     time.sleep(SETTLE)
     claw_open()
-    _goto(x, y, TRAVEL_Z, f"lift from {square}")
+    retreat(square)
     claw_pump_off()
-    return True
+    return ok
 
 def go_park():
     """Park high and clear so the camera sees the whole board."""
@@ -512,7 +658,7 @@ def go_park():
             print(f"[Park] blind move failed: {e}")
             clear_alarms()
         return
-    lift("lift before park")
+    retreat("park")            # a far-rank square cannot be left straight up
     if not _goto(px, py, pz, "park"):
         clear_alarms()
         time.sleep(0.2)
@@ -634,7 +780,8 @@ def arm_move_piece(from_sq, to_sq, piece_symbol):
         print(f"  [ARM] {from_sq}: pick failed - not placing anything")
         send("MSG:could not pick up the piece - check the board")
         return
-    place(tx, ty, tz, to_sq)
+    if not place(tx, ty, tz, to_sq):
+        send(f"MSG:could not place on {to_sq} - put it there by hand")
 
 def grave_spot(colour):
     return GRAVE_W if colour == "w" else GRAVE_B
@@ -665,7 +812,8 @@ def arm_remove_piece(square, piece_symbol):
         print(f"  [ARM] {square}: pick failed - remove the piece by hand")
         send("MSG:could not pick up the captured piece")
         return
-    place(gx, gy, gz, "pile")
+    if not place(gx, gy, gz, "pile"):
+        send("MSG:could not reach the pile - take the piece off by hand")
     _graves[colour] += 1
 
 
