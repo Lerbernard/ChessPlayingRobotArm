@@ -95,6 +95,31 @@ def install_fakes():
     sys.modules["chess.engine"] = chess.engine
 
 
+class ShellDobot(FakeDobot):
+    """
+    A realistic arm: its workspace is a shell, so the higher it goes the less
+    it can fold in toward its base. Asked for a point inside that limit it
+    stops short, on the same line, exactly as the real one does.
+
+    This is the arm from the g8 failure: asked for (120.2, -86.4, 65.0) - a
+    radius of 148 mm - it stopped at a radius of 181.
+    """
+
+    @staticmethod
+    def min_radius(z):
+        return 148.0 + max(0.0, z) * 0.5        # 148 at board height, 181 at z=65
+
+    def _set_ptp_cmd(self, x, y, z, r, mode=None, wait=False):
+        import math
+        MOVES.append(("move", x, y, z))
+        lo = self.min_radius(z)
+        d = math.hypot(x, y)
+        if d < lo:                               # refused - stop short on the line
+            x, y = x * lo / d, y * lo / d
+        self.pos = [x, y, z]
+        return FakeResponse()
+
+
 def report(title):
     print(f"\n=== {title} ===")
     for m in MOVES:
@@ -126,7 +151,29 @@ def main():
     chess_pi.arm_move_piece("e4", "d5", "P")
     capture = report("capture: exd5")
 
+    # ---- the same move on an arm that cannot fold in up high ----
+    MOVES.clear()
+    chess_pi.arm = ShellDobot()
+    chess_pi.LANE_R["min"] = chess_pi.LANE_R["max"] = None
+    chess_pi._last[:] = [205.1, -5.4, 120.0]
+    chess_pi._claw["closed"] = None
+    near = min(("a8", "h8"),
+               key=lambda sq: (board := chess_pi.board_config.SQUARE_MAP[sq]["p"])
+               and (board["x"] ** 2 + board["y"] ** 2))
+    e = chess_pi.board_config.SQUARE_MAP[near]["p"]
+    print(f"\n(now on an arm whose travel lane folds in no closer than "
+          f"{ShellDobot.min_radius(chess_pi.TRAVEL_Z):.0f} mm; {near} sits at "
+          f"{(e['x'] ** 2 + e['y'] ** 2) ** 0.5:.0f} mm)")
+    picked = chess_pi.pick(e["x"], e["y"], e["z"], near)
+    shell = report(f"far-rank pick: {near}")
+
     failures = []
+    if not picked:
+        failures.append(f"{near} could not be picked on the shell arm")
+    if chess_pi.LANE_R["min"] is None:
+        failures.append("the lane's fold-in limit was never learned")
+    if not any(m[0] == "grip" and m[1] is True for m in MOVES):
+        failures.append("the claw never closed on the piece")
     if len(quiet) != 6:
         failures.append(f"quiet move took {len(quiet)} arm moves, expected 6")
     if len(capture) != 12:
