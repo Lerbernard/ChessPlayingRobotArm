@@ -62,6 +62,10 @@ MOVE_BASE      = 0.9     # generous per-move floor so we never outrun the arm
 SETTLE         = 0.15    # pause after a move so the arm stops shaking before
                          # the claw opens or closes
 THINK_TIME     = 0.5
+# The arm self-test at startup is a motion the game does not need. It is off
+# by default so the arm stays parked until there is a real move to play; the
+# ARM TEST button on the touchscreen still runs it whenever you want it.
+SELFTEST_AT_START = False
 # Where the arm parks (high, clear) before the camera reads the board. Set it
 # yourself on the ARM calibration screen (HIGH PARK row); that writes PARK into
 # board_config.py. This is just the fallback if you haven't set one.
@@ -247,6 +251,9 @@ import struct as _struct
 
 _last = [999.0, 999.0, 999.0]      # last known position; 999 = unknown
 
+# How close counts as "on target". If EVERY move reports a few mm off in the
+# log, the arm's pose readback simply is not that repeatable - raise this
+# rather than letting good moves be reported as failures.
 VERIFY_TOL  = 5.0                  # mm: closer than this counts as on target
 CORRECT_MAX = 30.0                 # mm: nudge back on target up to this much
 
@@ -271,24 +278,15 @@ def _read_pose():
     except Exception:
         return None
 
-def _goto(x, y, z, label="", nudge=True):
-    """
-    Send the arm to ONE absolute point and confirm it got there.
-    Returns True if the arm is within tolerance of (x, y, z).
-    """
+def _send_move(x, y, z):
+    """Issue ONE linear move and wait for the arm to finish executing it."""
     dist = (math.dist(tuple(_last), (x, y, z)) if _last[0] < 900 else 250.0)
     est  = MOVE_BASE + dist / MOVE_SPEED
-
-    try:
-        if _MOVL is not None:
-            resp = dobot(arm._set_ptp_cmd, x, y, z, 0, mode=_MOVL, wait=False)
-        else:
-            resp = dobot(arm.move_to, x, y, z, 0, wait=False)
-    except Exception as e:
-        print(f"  [Move] {label} command failed: {e}")
-        clear_alarms()
-        return False
-
+    # Always MOVL: a joint move arcs, and an arc goes through the pieces.
+    if _MOVL is not None:
+        resp = dobot(arm._set_ptp_cmd, x, y, z, 0, mode=_MOVL, wait=False)
+    else:
+        resp = dobot(arm.move_to, x, y, z, 0, wait=False)
     idx = None
     try:
         if resp is not None and getattr(resp, "params", None):
@@ -301,32 +299,59 @@ def _goto(x, y, z, label="", nudge=True):
     else:
         time.sleep(est)
 
+def _miss(x, y, z):
+    """
+    Update _last from the arm and return how far it is from (x, y, z).
+    Returns None if the arm will not say where it is - then we trust the
+    command, exactly as before.
+    """
     pos = _read_pose()
-    if pos is None:                       # cannot check - trust the command
+    if pos is None:
         _last[0], _last[1], _last[2] = x, y, z
-        return True
+        return None
     _last[0], _last[1], _last[2] = pos
-    off = math.dist(pos, (x, y, z))
-    if off <= VERIFY_TOL:
+    return math.dist(pos, (x, y, z))
+
+def _goto(x, y, z, label="", nudge=True):
+    """
+    Send the arm to ONE absolute point and confirm it got there.
+    Returns True if the arm is within tolerance of (x, y, z).
+    """
+    try:
+        _send_move(x, y, z)
+    except Exception as e:
+        print(f"  [Move] {label} command failed: {e}")
+        clear_alarms()
+        return False
+
+    off = _miss(x, y, z)
+    if off is None or off <= VERIFY_TOL:
         return True
 
     if nudge and off <= CORRECT_MAX:
-        # Same MOVL as the main move: a joint move here would ARC through the
-        # pieces on its way to a target only millimetres away.
         print(f"  [Move] {label}: {off:.1f}mm off - nudging onto target")
         try:
-            if _MOVL is not None:
-                dobot(arm._set_ptp_cmd, x, y, z, 0, mode=_MOVL, wait=False)
-            else:
-                dobot(arm.move_to, x, y, z, 0, wait=False)
-            time.sleep(MOVE_BASE + off / MOVE_SPEED + 0.3)
+            _send_move(x, y, z)
+            off = _miss(x, y, z)
         except Exception:
             pass
-        pos = _read_pose()
-        if pos:
-            _last[0], _last[1], _last[2] = pos
-            off = math.dist(pos, (x, y, z))
-        if off <= VERIFY_TOL:
+        if off is None or off <= VERIFY_TOL:
+            return True
+
+    if nudge:
+        # The usual reason the arm ignores a move is the ALARM state (the RED
+        # light): it trips on a point at the edge of the reach and from then on
+        # every command is dropped silently. Clear it and try the point once
+        # more before giving up on the move.
+        print(f"  [Move] {label}: still {off:.1f}mm off - clearing alarms, retrying")
+        clear_alarms()
+        time.sleep(0.3)
+        try:
+            _send_move(x, y, z)
+            off = _miss(x, y, z)
+        except Exception:
+            pass
+        if off is None or off <= VERIFY_TOL:
             return True
 
     print(f"  [Move] {label}: asked ({x:.1f},{y:.1f},{z:.1f}) but arm is at "
@@ -410,21 +435,44 @@ def reach_ok(x, y):
 # nothing the travel-height arrival had not already verified.
 
 def travel_to(x, y, label=""):
-    """Rise into the travel lane, then cross to (x, y) - still up high."""
-    lift(f"lift before {label}" if label else "lift")
-    return _goto(x, y, TRAVEL_Z, f"over {label}" if label else "travel")
+    """
+    Rise into the travel lane, then cross to (x, y) - still up high.
+
+    If the straight line is refused, go again in two shorter linear hops
+    through the halfway point. A Dobot will not always interpolate one long
+    MOVL right across its workspace: it stops part-way and trips the alarm,
+    which looks exactly like the arm wandering out and coming back. Both ends
+    of the hop are at travel height, so the halfway point is too - there is
+    nothing up there to hit.
+    """
+    name = label or "travel"
+    lift(f"lift before {name}")
+    if _goto(x, y, TRAVEL_Z, f"over {name}"):
+        return True
+    mx, my = (_last[0] + x) / 2.0, (_last[1] + y) / 2.0
+    print(f"  [Move] straight line to {name} refused - going via the halfway "
+          f"point ({mx:.1f}, {my:.1f})")
+    _goto(mx, my, TRAVEL_Z, "halfway")
+    return _goto(x, y, TRAVEL_Z, f"over {name}")
 
 def pick(x, y, z, square="?"):
     """Open the claw, cross to the square, descend, close on the piece, lift."""
     print(f"  [Pick] {square} at ({x:.1f}, {y:.1f}, {z:.1f})")
     claw_open()                                   # opens while it travels
     if not travel_to(x, y, square):
-        # Never descend from a spot we could not confirm: the claw would come
-        # down diagonally, through whatever is in between.
-        print(f"  [Pick] {square}: could not get over the square - not grabbing")
-        return False
+        # A few mm out is normal and the descent re-commands X and Y anyway,
+        # so carry on. Only give up if the arm is so far off that it is over a
+        # DIFFERENT square - descending there would hit the wrong piece.
+        off = math.hypot(_last[0] - x, _last[1] - y)
+        print(f"  [Pick] {square}: arrival {off:.1f}mm off target")
+        if off > PITCH / 2.0:
+            print(f"  [Pick] {square}: that is more than half a square - not "
+                  f"descending. Is the RED alarm light on, or the square out "
+                  f"of reach?")
+            return False
     if not _goto(x, y, z, f"down onto {square}"):
-        print(f"  [Pick] {square}: not at the piece - not grabbing")
+        print(f"  [Pick] {square}: not at the piece - not grabbing "
+              f"(see the [Move] line above for where it actually stopped)")
         _goto(x, y, TRAVEL_Z, "retreat")
         return False
     time.sleep(SETTLE)
@@ -1743,8 +1791,11 @@ def main():
 
     threading.Thread(target=camera_thread, daemon=True).start()
 
-    # prove the arm works before anything else
-    arm_selftest()
+    if SELFTEST_AT_START:          # off by default - see the CONFIG section
+        arm_selftest()
+    else:
+        print("[Host] skipping the startup self-test (SELFTEST_AT_START=False)."
+              " Press ARM TEST on the screen to run it.")
 
     print("\n[Host] ready. Drive everything from the touchscreen.\n")
     go_park()
