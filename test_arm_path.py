@@ -120,6 +120,22 @@ class ShellDobot(FakeDobot):
         return FakeResponse()
 
 
+def low_drags(moves, ceiling):
+    """
+    Horizontal runs made down among the pieces - the thing that knocks them
+    over. A move counts if it travels more than half a square sideways while
+    staying below `ceiling`.
+    """
+    import math
+    found = []
+    pts = [(m[1], m[2], m[3]) for m in moves if m[0] in ("move", "MOVJ")]
+    for a, b in zip(pts, pts[1:]):
+        flat = math.hypot(b[0] - a[0], b[1] - a[1])
+        if flat > 12.0 and max(a[2], b[2]) < ceiling:
+            found.append(f"{flat:.0f}mm sideways at z={max(a[2], b[2]):.0f}")
+    return found
+
+
 def report(title):
     print(f"\n=== {title} ===")
     for m in MOVES:
@@ -167,7 +183,12 @@ def main():
     picked = chess_pi.pick(e["x"], e["y"], e["z"], near)
     shell = report(f"far-rank pick: {near}")
 
+    ceiling = chess_pi._BOARD_TOP_Z + 30.0
+    drags = low_drags(MOVES, ceiling)
+
     failures = []
+    for d in drags:
+        failures.append(f"dragged low among the pieces: {d}")
     if not picked:
         failures.append(f"{near} could not be picked on the shell arm")
     if chess_pi.LANE_R["min"] is None:
