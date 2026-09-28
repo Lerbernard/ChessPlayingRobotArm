@@ -78,6 +78,12 @@ SELFTEST_AT_START = False
 # first far-rank move of the session then costs one wasted reach).
 LANE_MIN_R = 184.0       # closest the arm folds in up in the travel lane
 LANE_MAX_R = None        # furthest it reaches out up there (None = learn it)
+# How far PAST that limit the arm enters and leaves such a square, in squares.
+# It has to move outward before it can climb, so it climbs on a slope - and
+# the shorter the slope, the steeper it is and the more room the claw has over
+# the pieces it crosses. Too short and the arm refuses the line as outside its
+# workspace; it then retries a square further out on its own.
+LANE_MARGIN_SQUARES = 0.5
 # Where the arm parks (high, clear) before the camera reads the board. Set it
 # yourself on the ARM calibration screen (HIGH PARK row); that writes PARK into
 # board_config.py. This is just the fallback if you haven't set one.
@@ -516,18 +522,29 @@ def _along_file_to_radius(x, y, want_r):
     t = min((-b + root, -b - root), key=abs)
     return x + t * ax, y + t * ay
 
-def lane_point(x, y):
+def lane_points(x, y):
     """
-    Where the arm sits in the TRAVEL LANE when it is working on (x, y): the
-    square itself when the lane reaches it, otherwise the nearest point along
-    its file that the lane does reach.
+    Where the arm sits in the TRAVEL LANE when it is working on (x, y).
+
+    For a square the lane reaches, that is the square itself: [(x, y)]. For
+    one it does not, these are the points along the square's file to enter
+    and leave by, STEEPEST FIRST - the first is the one that keeps the claw
+    highest over the neighbours, the next is a square further out for when
+    the arm will not take the first.
     """
     r = math.hypot(x, y)
-    if LANE_R["min"] is not None and r < LANE_R["min"] - 0.5:
-        return _along_file_to_radius(x, y, LANE_R["min"])
-    if LANE_R["max"] is not None and r > LANE_R["max"] + 0.5:
-        return _along_file_to_radius(x, y, LANE_R["max"])
-    return x, y
+    lo, hi = LANE_R["min"], LANE_R["max"]
+    if lo is not None and r < lo - 0.5:
+        return [_along_file_to_radius(x, y, lo + m * PITCH)
+                for m in (LANE_MARGIN_SQUARES, LANE_MARGIN_SQUARES + 1.0)]
+    if hi is not None and r > hi + 0.5:
+        return [_along_file_to_radius(x, y, hi - m * PITCH)
+                for m in (LANE_MARGIN_SQUARES, LANE_MARGIN_SQUARES + 1.0)]
+    return [(x, y)]
+
+def lane_point(x, y):
+    """The point the arm normally works (x, y) from - see lane_points()."""
+    return lane_points(x, y)[0]
 
 def _learn_lane_limit(want_x, want_y):
     """
@@ -562,6 +579,8 @@ def travel_to(x, y, label=""):
     height, so the halfway point is too - there is nothing up there to hit.
     """
     name = label or "travel"
+    if _last[0] < 900 and math.dist(tuple(_last), (x, y, TRAVEL_Z)) <= VERIFY_TOL:
+        return True                    # already standing there
     lift(f"lift before {name}")
     if _goto(x, y, TRAVEL_Z, f"over {name}"):
         return True
@@ -578,24 +597,41 @@ def approach(x, y, z, square="?"):
     Bring the claw down onto (x, y, z), whichever way the arm's reach allows.
     Returns True only if it actually arrived.
     """
-    lx, ly = lane_point(x, y)
+    entries = lane_points(x, y)
+    lx, ly = entries[0]
     if not travel_to(lx, ly, square):
         if _learn_lane_limit(lx, ly):
             clear_alarms()                     # the short stop will have tripped it
             time.sleep(0.2)
-            lx, ly = lane_point(x, y)          # limits changed - new entry point
+            entries = lane_points(x, y)        # limits changed - new entry point
+            lx, ly = entries[0]
             if not travel_to(lx, ly, square):
                 return False
         elif math.dist((_last[0], _last[1]), (lx, ly)) > PITCH / 2.0:
             print(f"  [Reach] {square}: the arm stopped more than half a square"
                   f" from where it should be. Is the RED alarm light on?")
             return False
-    if math.dist((lx, ly), (x, y)) > 0.5:      # coming in along the file
-        if not _goto(lx, ly, z + HOVER, f"down on {square}'s file"):
-            return False
-        if not _goto(x, y, z + HOVER, f"in along the file to {square}"):
-            return False
+    if math.dist((lx, ly), (x, y)) <= 0.5:          # the lane reaches it
         return _goto(x, y, z, f"down onto {square}")
+
+    # Coming in along the file: descend ON THE WAY IN, in one sloping move, so
+    # the claw stays high over the squares it crosses instead of skimming
+    # them. Steepest slope first; a refused line is retried from further out.
+    for ex, ey in entries:
+        if not travel_to(ex, ey, square):
+            continue
+        if _goto(x, y, z + HOVER, f"down the slope onto {square}"):
+            return _goto(x, y, z, f"down onto {square}")
+        print(f"  [Move] {square}: that line was refused - trying a gentler one")
+
+    # Nothing sloping worked. Flat is the one path that skims the squares in
+    # between, so it is the last resort and it says so.
+    print(f"  [Move] {square}: coming in FLAT along the file - watch the "
+          f"pieces on the way")
+    if not _goto(lx, ly, z + HOVER, f"down on {square}'s file"):
+        return False
+    if not _goto(x, y, z + HOVER, f"in along the file to {square}"):
+        return False
     return _goto(x, y, z, f"down onto {square}")
 
 def retreat(square="?"):
@@ -607,10 +643,23 @@ def retreat(square="?"):
     if _last[0] > 900:
         return
     x, y, z = _last[0], _last[1], _last[2]
-    lx, ly = lane_point(x, y)
-    if math.dist((lx, ly), (x, y)) > 0.5:
-        _goto(x, y, z + HOVER, f"lift clear of {square}")
-        _goto(lx, ly, _last[2], f"back out along {square}'s file")
+    exits = lane_points(x, y)
+    if math.dist(exits[0], (x, y)) <= 0.5:          # the lane reaches it
+        _goto(x, y, TRAVEL_Z, f"lift from {square}")
+        return
+
+    # The arm cannot lift straight out of this square: it has to move outward
+    # first, and it CLIMBS while it does. Backing out flat is what drags the
+    # piece it is holding across its neighbours and knocks them over.
+    _goto(x, y, z + HOVER, f"lift clear of {square}")
+    for ex, ey in exits:
+        if _goto(ex, ey, TRAVEL_Z, f"up and out along {square}'s file"):
+            return
+        print(f"  [Move] {square}: that climb was refused - trying a gentler one")
+
+    lx, ly = exits[-1]
+    print(f"  [Move] {square}: backing out FLAT - watch the pieces on the way")
+    _goto(lx, ly, _last[2], f"back out along {square}'s file")
     _goto(lx, ly, TRAVEL_Z, f"lift from {square}")
 
 def pick(x, y, z, square="?"):
