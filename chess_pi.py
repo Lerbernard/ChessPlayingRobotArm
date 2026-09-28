@@ -491,12 +491,15 @@ def reach_ok(x, y):
 # PIECE height but not in the lane above them: the arm stops short and trips
 # the alarm, which looks like it wandering out over the board and coming back.
 #
-# So for a square the lane cannot reach, the arm goes as far along that
-# square's OWN FILE as the lane does reach, drops to HOVER above the pieces
-# there, and slides in along the file - pieces on the file pass between the
-# open fingers. It backs out the same way before it rises. Every other square
-# is still the straight three moves, and nothing ever detours via the middle
-# of the board.
+# So a square the lane cannot reach is entered and left along its OWN FILE,
+# on a SLOPE: the arm stays up in the lane until it is near the square and
+# descends on the way in, and on the way out it climbs as it backs off, so it
+# is well above the neighbouring pieces by the time it crosses them. Going out
+# flat is what drags a held piece across its neighbours and knocks them over -
+# that path is the last resort, and it is announced when it happens.
+#
+# Every other square is still the straight three moves, and nothing ever
+# detours via the middle of the board.
 
 LANE_R = {"min": LANE_MIN_R, "max": LANE_MAX_R}
 
