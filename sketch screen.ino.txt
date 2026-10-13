@@ -9,6 +9,7 @@
      SET_ARM:ALL         arm moves BOTH sides
      SET_ARM:ENGINE      arm moves only the engine's pieces
      START_MATCH         settings screen
+     END_TURN            read my move off the board now (auto-detect missed)
      e2e4                human move (UCI, 4-5 chars, promo ok: e7e8q)
      REMOVED             user confirmed the captured piece is off the board
      RESET               quit to menu
@@ -16,18 +17,30 @@
      CAL_CAPTURE:a1      read the arm's pose, store it as corner a1
      CAL_CAPTURE:gw      store it as the drop spot for captured WHITE pieces
      CAL_CAPTURE:gb      store it as the drop spot for captured BLACK pieces
+     CAL_CAPTURE:park    store it as the high park spot
+     CAL_CAPTURE:floor   store it as the table surface
+     CAL_CHANGED:a1,gw,  which rows were captured this session
      CAL_SAVE            fit the 4 corners and write board_config.py
      CAL_EXIT            leave calibration mode
+     CAM_CAL             start camera calibration (Pi sends a snapshot)
+     CAM_REFRESH         send a fresh snapshot
+     CAM_CORNER:ix,iy    a tapped board corner, in snapshot pixels
+     CAM_UNDO            forget the last corner
+     CAM_SAVE / CAM_CANCEL
 
    HOST  ->  ESP32
      REMOVE:e5           show modal: "take the piece off e5", wait for REMOVED
      ILLEGAL             roll board back to backup
+     READING / NO_MOVE   END_TURN progress
+     MSG:<text>          something the human must do - shown in the side panel
      STATUS:CHECKMATE    end-of-game banner
      e2e4                AI move to apply to the display
      FEN:<pos>           authoritative board position
      CAL_OK:a1:x,y,z     corner captured, here are the numbers
-     CAL_SAVED           board_config.py written
+     CAL_SAVED           board_config.py written -> back to the start page
      CAL_ERR:<msg>       something went wrong
+     IMG_START:w:h       a snapshot follows (w*h*2 bytes of RGB565)
+     CAM_DONE / CAM_ERR  camera calibration over -> back to the start page
    ========================================================================= */
 
 #define LGFX_USE_V1
@@ -85,7 +98,20 @@ public:
 LGFX tft;
 const int SQUARE_SIZE = 60;
 
-enum GameState { START_SCREEN, SETTINGS_SCREEN, PLAY_SCREEN, CALIBRATION_SCREEN };
+enum GameState { START_SCREEN, SETTINGS_SCREEN, PLAY_SCREEN, CALIBRATION_SCREEN, CAMERA_CAL_SCREEN };
+
+// --- camera calibration on-screen state ---
+#define CAM_W 176                  // 16:9 snapshot width from the Pi
+#define CAM_H 99                  // 16:9 snapshot height
+uint16_t camImg[CAM_W * CAM_H];    // received RGB565 image
+bool     camImgReady = false;
+int      camCorners[4][2];         // tapped corners, in board-image pixels
+int      camCornerN = 0;
+const int CAM_VIEW_X = 12;         // where the image is drawn on screen
+const int CAM_VIEW_Y = 60;
+const int CAM_ZOOM   = 3;          // 176x99 * 3 = 528 x 297 on screen
+const int CAM_VIEW_W = CAM_W * CAM_ZOOM;   // displayed width
+const int CAM_VIEW_H = CAM_H * CAM_ZOOM;   // displayed height
 GameState currentState = START_SCREEN;
 
 int  selectedElo    = 1350;
@@ -96,13 +122,15 @@ bool armMovesAll    = false;   // false = arm plays the engine only
 char board[8][8];
 char backupBoard[8][8];
 String gameStatusText = "";
+String startNote      = "";    // one-line note shown on the start page once
+                               // (e.g. "Arm calibration saved")
 
 // --- calibration state ---
-#define CAL_N 6
-const char* CAL_CORNERS[CAL_N] = {"a1", "h1", "a8", "h8", "gw", "gb"};
-const char* CAL_LABELS[CAL_N]  = {"A1", "H1", "A8", "H8", "DROP W", "DROP B"};
-String calValue[CAL_N] = {"", "", "", "", "", ""};
-bool   calDone[CAL_N]  = {false, false, false, false, false, false};
+#define CAL_N 8
+const char* CAL_CORNERS[CAL_N] = {"a1", "h1", "a8", "h8", "gw", "gb", "park", "floor"};
+const char* CAL_LABELS[CAL_N]  = {"A1", "H1", "A8", "H8", "DROP W", "DROP B", "HIGH PARK", "FLOOR"};
+String calValue[CAL_N] = {"", "", "", "", "", "", "", ""};
+bool   calDone[CAL_N]  = {false, false, false, false, false, false, false, false};
 int    calIndex        = 0;
 String calMessage      = "";
 bool   calBusy         = false;   // CAPTURE is locked until the host replies
@@ -135,6 +163,9 @@ void applyFEN(String fen);
 void drawCalibrationScreen();
 void handleTouchCalibration(int x, int y);
 void handleTouchStart(int x, int y);
+void drawCameraCalScreen();
+void handleTouchCameraCal(int x, int y);
+void receiveCameraImage(int w, int h);
 void handleTouchSettings(int x, int y);
 void handleTouchPlay(int x, int y);
 void handleTouchRemoval(int x, int y);
@@ -144,6 +175,7 @@ void resetLocalGame();
 void drawChessPiece(int x, int y, char piece);
 void setSidePanelMessage(String msg, uint16_t color);
 void highlightSquare(int row, int col, uint16_t color);
+bool looksLikeMove(const String& s);
 
 // Board index  ->  screen cell (flips the view when the human plays Black)
 inline int screenRow(int row) { return playingAsWhite ? row : 7 - row; }
@@ -160,6 +192,28 @@ void setup() {
 }
 
 void loop() {
+  // ---------------- CAMERA CALIBRATION MESSAGES (incl. binary image) ----
+  if (currentState == CAMERA_CAL_SCREEN && Serial.available() > 0) {
+    String r = Serial.readStringUntil('\n');
+    r.trim();
+    if (r.startsWith("IMG_START:")) {
+      // IMG_START:w:h  then w*h*2 raw RGB565 big-endian bytes follow
+      int c1 = r.indexOf(':');
+      int c2 = r.indexOf(':', c1 + 1);
+      int w = r.substring(c1 + 1, c2).toInt();
+      int h = r.substring(c2 + 1).toInt();
+      Serial.println("IMG_READY");     // tell the Pi we're set to read bytes
+      Serial.flush();
+      receiveCameraImage(w, h);
+      drawCameraCalScreen();
+    }
+    else if (r == "CAM_DONE" || r.startsWith("CAM_ERR")) {
+      currentState = START_SCREEN;
+      drawStartScreen();
+    }
+    return;
+  }
+
   // ---------------- INCOMING HOST MESSAGES ----------------
   if ((currentState == PLAY_SCREEN || currentState == CALIBRATION_SCREEN)
       && Serial.available() > 0) {
@@ -182,20 +236,27 @@ void loop() {
 
       for (int i = 0; i < CAL_N; i++) {
         if (sq == CAL_CORNERS[i]) {
+          bool wasDone = calDone[i];       // re-doing an already-captured row?
           calValue[i] = "X " + xs + "  Y " + ys + "  Z " + zs;
           calDone[i] = true;
-          if (calIndex == i && i < CAL_N - 1) calIndex = i + 1;   // advance
+          // Auto-advance only on the FIRST capture of a row (the initial sweep).
+          // If you tapped a finished row to fix just it, stay put.
+          if (!wasDone && calIndex == i && i < CAL_N - 1) calIndex = i + 1;
         }
       }
-      calMessage = "Captured " + sq + " - now MOVE THE ARM to the next one";
+      calMessage = "Captured " + sq + " - tap another row to re-do it, or SAVE";
       calBusy = false;
       drawCalibrationScreen();
       return;
     }
     else if (response == "CAL_SAVED") {
+      // Saved. Leave calibration and go back to the start page, the same way
+      // the camera calibration does when it finishes.
       calBusy = false;
-      calMessage = "SAVED to board_config.py";
-      drawCalibrationScreen();
+      Serial.println("CAL_EXIT");
+      startNote = "Arm calibration saved";
+      currentState = START_SCREEN;
+      drawStartScreen();
       return;
     }
     else if (response.startsWith("CAL_ERR:")) {
@@ -205,13 +266,31 @@ void loop() {
       return;
     }
 
+    // ---- camera-calibration replies (we're on a message screen) ----
+    if (response == "CAM_BUSY") {
+      return;                       // Pi is running the calibration window
+    }
+    else if (response == "CAM_DONE" || response.startsWith("CAM_ERR")) {
+      currentState = START_SCREEN;
+      drawStartScreen();
+      return;
+    }
+
     if (currentState != PLAY_SCREEN) return;
 
-    if (response == "ILLEGAL") {
-      memcpy(board, backupBoard, sizeof(backupBoard));
-      selectMode = false;
-      setSidePanelMessage("Move Illegal!", TFT_RED);
-      renderBoardState();
+    if (response == "READING") {
+      setSidePanelMessage("Reading the board...", TFT_YELLOW);
+    }
+    else if (response == "NO_MOVE") {
+      setSidePanelMessage("No move seen - try again", TFT_RED);
+    }
+    else if (response == "ILLEGAL") {
+      setSidePanelMessage("Illegal move - fix & retry", TFT_RED);
+    }
+    else if (response.startsWith("MSG:")) {
+      // Something the human has to do (fix a square, place a piece by hand).
+      // Shown wrapped, so a long one is read in full instead of cut off.
+      setSidePanelMessage(response.substring(4), TFT_YELLOW);
     }
     else if (response.startsWith("REMOVE:")) {
       // Host detected a capture. Ask the human to physically clear the square.
@@ -224,13 +303,14 @@ void loop() {
     }
     else if (response.startsWith("STATUS:")) {
       gameStatusText = response.substring(7);
-      tft.fillRect(495, 195, 300, 90, TFT_BLACK);
+      // draw the game-over banner over the END TURN button area
+      tft.fillRect(495, 250, 300, 90, TFT_BLACK);
       tft.setTextColor(TFT_YELLOW);
       tft.setTextSize(3);
-      tft.drawString(gameStatusText, 500, 230);
+      tft.drawCenterString(gameStatusText, 640, 285);
       tft.setTextSize(2);
     }
-    else if (response.length() >= 4 && !awaitingRemoval) {
+    else if (looksLikeMove(response) && !awaitingRemoval) {
       setSidePanelMessage("AI Played: " + response, TFT_GREEN);
       executeMoveOnMatrix(response);
       renderBoardState();
@@ -238,6 +318,11 @@ void loop() {
       int tCol = response[2] - 'a';
       int tRow = 8 - (response[3] - '0');
       highlightSquare(tRow, tCol, TFT_GREEN);
+    }
+    else if (response.length() > 0 && !awaitingRemoval) {
+      // Anything else the Pi says is worth showing rather than mistaking it
+      // for a move (that is how "MSG:..." used to end up as "AI Played: MSG").
+      setSidePanelMessage(response, TFT_YELLOW);
     }
   }
 
@@ -249,8 +334,19 @@ void loop() {
     else if (currentState == SETTINGS_SCREEN)  handleTouchSettings(tx, ty);
     else if (currentState == PLAY_SCREEN)      handleTouchPlay(tx, ty);
     else if (currentState == CALIBRATION_SCREEN) handleTouchCalibration(tx, ty);
-    delay(200);
+    else if (currentState == CAMERA_CAL_SCREEN) handleTouchCameraCal(tx, ty);
+    // shorter debounce on the camera screen so incoming image bytes aren't
+    // dropped while we're blocked in delay()
+    if (currentState == CAMERA_CAL_SCREEN) delay(60);
+    else delay(200);
   }
+}
+
+// A UCI move: e2e4, or e7e8q with a promotion piece.
+bool looksLikeMove(const String& s) {
+  if (s.length() < 4 || s.length() > 5) return false;
+  return s[0] >= 'a' && s[0] <= 'h' && s[1] >= '1' && s[1] <= '8'
+      && s[2] >= 'a' && s[2] <= 'h' && s[3] >= '1' && s[3] <= '8';
 }
 
 // =========================================================================
@@ -344,11 +440,42 @@ void hideRemovalPrompt() {
 // =========================================================================
 //  SIDE PANEL / HIGHLIGHT HELPERS
 // =========================================================================
+
+// Break msg into lines of at most maxChars, at spaces where it can. Returns
+// the number of lines written to out[] (at most maxLines; the rest is dropped).
+static int wrapLines(const String& msg, int maxChars, String out[], int maxLines) {
+  int n = 0;
+  String rest = msg;
+  rest.trim();
+  while (rest.length() > 0 && n < maxLines) {
+    if ((int)rest.length() <= maxChars) { out[n++] = rest; break; }
+    int cut = rest.lastIndexOf(' ', maxChars);
+    if (cut <= 0) cut = maxChars;            // one long word: break it anyway
+    out[n++] = rest.substring(0, cut);
+    rest = rest.substring(cut);
+    rest.trim();
+  }
+  return n;
+}
+
+// The message area is 300 px wide and 40 px tall: that is 24 characters per
+// line at text size 2 (two lines), or 49 at size 1 (four lines). A message
+// is shown at the biggest size it fits at, instead of running off the panel.
 void setSidePanelMessage(String msg, uint16_t color) {
   tft.fillRect(495, 195, 300, 40, TFT_BLACK);
-  tft.setTextSize(2);
   tft.setTextColor(color);
-  tft.drawString(msg, 500, 200);
+
+  String lines[4];
+  int n = wrapLines(msg, 24, lines, 3);
+  if (n <= 2) {
+    tft.setTextSize(2);
+    for (int i = 0; i < n; i++) tft.drawString(lines[i], 500, 197 + i * 18);
+    return;
+  }
+  n = wrapLines(msg, 49, lines, 4);
+  tft.setTextSize(1);
+  for (int i = 0; i < n; i++) tft.drawString(lines[i], 500, 196 + i * 10);
+  tft.setTextSize(2);
 }
 
 void highlightSquare(int row, int col, uint16_t color) {
@@ -459,17 +586,29 @@ void drawStartScreen() {
   tft.setTextColor(TFT_CYAN);
   tft.drawCenterString("VIPER Lab Outreach Terminal", 400, 190);
 
+  // a one-off note from the screen we just came back from, e.g. "saved"
+  if (startNote != "") {
+    tft.setTextColor(TFT_GREEN);
+    tft.drawCenterString(startNote, 400, 230);
+    startNote = "";
+  }
+
   tft.fillRoundRect(280, 270, 240, 70, 12, tft.color565(40, 150, 40));
   tft.drawRoundRect(280, 270, 240, 70, 12, TFT_WHITE);
   tft.setTextColor(TFT_WHITE);
   tft.setTextSize(3);
   tft.drawCenterString("ENTER GAME", 400, 292);
 
-  tft.fillRoundRect(280, 360, 240, 60, 12, tft.color565(70, 70, 90));
-  tft.drawRoundRect(280, 360, 240, 60, 12, TFT_WHITE);
+  tft.fillRoundRect(150, 360, 240, 60, 12, tft.color565(70, 70, 90));
+  tft.drawRoundRect(150, 360, 240, 60, 12, TFT_WHITE);
   tft.setTextSize(2);
   tft.setTextColor(TFT_WHITE);
-  tft.drawCenterString("CALIBRATE ARM", 400, 380);
+  tft.drawCenterString("CALIBRATE ARM", 270, 380);
+
+  tft.fillRoundRect(410, 360, 240, 60, 12, tft.color565(50, 70, 100));
+  tft.drawRoundRect(410, 360, 240, 60, 12, TFT_WHITE);
+  tft.setTextColor(TFT_WHITE);
+  tft.drawCenterString("CALIBRATE CAMERA", 530, 380);
 }
 
 void drawSettingsScreen() {
@@ -551,7 +690,19 @@ void drawPlayInterface() {
 
   tft.setTextColor(tft.color565(120, 120, 120));
   tft.drawString(playingAsWhite ? "You: WHITE" : "You: BLACK", 500, 160);
-  tft.drawString(armMovesAll ? "Arm: BOTH SIDES" : "Arm: ENGINE ONLY", 500, 180);
+
+  tft.setTextColor(tft.color565(150, 150, 150));
+  tft.drawString("Just move your piece.", 500, 195);
+  tft.drawString("The camera reads it automatically.", 500, 215);
+
+  // END TURN is now an OPTIONAL manual trigger (if auto-detect misses)
+  tft.fillRoundRect(500, 255, 280, 80, 12, tft.color565(30, 100, 50));
+  tft.drawRoundRect(500, 255, 280, 80, 12, TFT_WHITE);
+  tft.setTextColor(TFT_WHITE); tft.setTextSize(3);
+  tft.drawCenterString("END TURN", 640, 272);
+  tft.setTextSize(1);
+  tft.drawCenterString("(only if auto-detect misses)", 640, 312);
+  tft.setTextSize(2);
 
   tft.fillRoundRect(520, 390, 240, 55, 8, tft.color565(120, 30, 30));
   tft.drawRoundRect(520, 390, 240, 55, 8, TFT_WHITE);
@@ -587,7 +738,8 @@ void handleTouchStart(int x, int y) {
     drawSettingsScreen();
     return;
   }
-  if (x >= 280 && x <= 520 && y >= 360 && y <= 420) {
+  // CALIBRATE ARM
+  if (x >= 150 && x <= 390 && y >= 360 && y <= 420) {
     Serial.println("CAL_ENTER");
     currentState = CALIBRATION_SCREEN;
     calIndex = 0;
@@ -595,6 +747,15 @@ void handleTouchStart(int x, int y) {
     calMessage = "Jog the arm by hand, then CAPTURE.";
     for (int i = 0; i < CAL_N; i++) { calDone[i] = false; calValue[i] = ""; }
     drawCalibrationScreen();
+    return;
+  }
+  // CALIBRATE CAMERA - now happens ON THIS SCREEN (Pi is headless)
+  if (x >= 410 && x <= 650 && y >= 360 && y <= 420) {
+    Serial.println("CAM_CAL");
+    currentState = CAMERA_CAL_SCREEN;
+    camImgReady = false;
+    camCornerN = 0;
+    drawCameraCalScreen();
   }
 }
 
@@ -653,6 +814,18 @@ void handleTouchPlay(int x, int y) {
     return;
   }
 
+  // END TURN: tell the Pi to read the move off the board with the camera
+  if (x >= 500 && x <= 780 && y >= 255 && y <= 335) {
+    if (gameStatusText != "") return;      // game over
+    Serial.println("END_TURN");
+    setSidePanelMessage("Reading the board...", TFT_YELLOW);
+    return;
+  }
+
+  // The board is now read by the CAMERA, not by tapping. Tapping does nothing.
+  return;
+
+  // (legacy tap-to-move code below is unreachable and kept for reference)
   if (gameStatusText != "") return;   // game is over
   if (x >= 480 || y >= 480) return;   // outside the board
 
@@ -796,40 +969,50 @@ void drawCalibrationScreen() {
   tft.drawString("ARM CALIBRATION", 40, 25);
   tft.drawFastHLine(40, 62, 720, tft.color565(90, 90, 110));
 
-  tft.setTextSize(2);
+  tft.setTextSize(1);
   tft.setTextColor(tft.color565(170, 170, 180));
-  tft.drawString("Hold the unlock button, put the claw where it would GRIP", 40, 78);
-  tft.drawString("a piece on the CENTRE of the square, then tap CAPTURE.", 40, 100);
+  tft.drawString("Jog the claw to each spot, then tap CAPTURE. Tap a row to re-do just that one.", 40, 74);
   tft.setTextColor(tft.color565(230, 170, 70));
-  tft.drawString("DROP W / DROP B = off-board spots for captured white / black.", 40, 112);
+  tft.drawString("DROP = piles for captured pieces.", 40, 90);
+  tft.setTextSize(2);
 
-  // --- the four corners + the graveyard drop spot ---
+  // --- the four corners + graveyard drop spots ---
   for (int i = 0; i < CAL_N; i++) {
     int ry = 128 + i * 42;
     bool active = (i == calIndex);
-    bool isGrave = (i >= 4);
+    bool isGrave = (i == 4 || i == 5);
 
     uint16_t rowBg = active ? tft.color565(50, 90, 140)
                             : (calDone[i] ? tft.color565(30, 70, 40)
                                           : tft.color565(38, 40, 50));
     tft.fillRoundRect(40, ry, 500, 36, 6, rowBg);
-    tft.drawRoundRect(40, ry, 500, 36, 6,
-                      active ? TFT_CYAN : (isGrave ? tft.color565(150, 110, 50)
-                                                   : tft.color565(80, 80, 95)));
+    uint16_t edge = active ? TFT_CYAN
+                   : isGrave ? tft.color565(150, 110, 50)
+                             : tft.color565(80, 80, 95);
+    tft.drawRoundRect(40, ry, 500, 36, 6, edge);
 
     tft.setTextSize(2);
-    tft.setTextColor(active ? TFT_CYAN : (isGrave ? tft.color565(230, 170, 70) : TFT_WHITE));
+    uint16_t txt = active ? TFT_CYAN
+                  : isGrave ? tft.color565(230, 170, 70)
+                            : TFT_WHITE;
+    tft.setTextColor(txt);
     tft.drawString(String(CAL_LABELS[i]), 54, ry + 10);
 
     if (calDone[i]) {
+      tft.setTextSize(1);
       tft.setTextColor(TFT_GREEN);
-      tft.drawString(calValue[i], 165, ry + 10);
+      tft.drawString(calValue[i], 210, ry + 14);
+      tft.setTextSize(2);
     } else {
+      tft.setTextSize(1);
       tft.setTextColor(tft.color565(120, 120, 130));
-      if (active)        tft.drawString("<-- capture this one", 165, ry + 10);
-      else if (i == 4)   tft.drawString("optional: taken WHITE pieces", 165, ry + 10);
-      else if (i == 5)   tft.drawString("optional: taken BLACK pieces", 165, ry + 10);
-      else               tft.drawString("not captured", 165, ry + 10);
+      if (active)        tft.drawString("<-- capture this one", 210, ry + 14);
+      else if (i == 4)   tft.drawString("optional: taken WHITE pieces", 210, ry + 14);
+      else if (i == 5)   tft.drawString("optional: taken BLACK pieces", 210, ry + 14);
+      else if (i == 6)   tft.drawString("HIGH spot arm rests at (camera view)", 210, ry + 14);
+      else if (i == 7)   tft.drawString("rest claw ON the table surface", 210, ry + 14);
+      else               tft.drawString("not captured", 210, ry + 14);
+      tft.setTextSize(2);
     }
   }
 
@@ -846,12 +1029,15 @@ void drawCalibrationScreen() {
   tft.setTextSize(2);
   tft.drawCenterString("NEXT CORNER", 662, 243);
 
-  bool all = calDone[0] && calDone[1] && calDone[2] && calDone[3];   // gy optional
+  // SAVE is always clickable now. The Pi merges: only the rows you captured
+  // this session change; everything else keeps its saved value.
+  bool anyDone = false;
+  for (int i = 0; i < CAL_N; i++) if (calDone[i]) anyDone = true;
   tft.fillRoundRect(565, 295, 195, 60, 10,
-                    all ? tft.color565(210, 130, 20) : tft.color565(55, 55, 60));
+                    anyDone ? tft.color565(210, 130, 20) : tft.color565(55, 55, 60));
   tft.drawRoundRect(565, 295, 195, 60, 10, TFT_WHITE);
   tft.setTextSize(3);
-  tft.setTextColor(all ? TFT_WHITE : tft.color565(110, 110, 115));
+  tft.setTextColor(anyDone ? TFT_WHITE : tft.color565(110, 110, 115));
   tft.drawCenterString("SAVE", 662, 313);
 
   tft.fillRoundRect(565, 370, 195, 50, 10, tft.color565(110, 35, 35));
@@ -863,7 +1049,7 @@ void drawCalibrationScreen() {
   // --- status line ---
   tft.setTextSize(2);
   tft.setTextColor(TFT_YELLOW);
-  tft.drawString(calMessage, 40, 385);
+  tft.drawString(calMessage, 40, 462);
 }
 
 void handleTouchCalibration(int x, int y) {
@@ -888,11 +1074,19 @@ void handleTouchCalibration(int x, int y) {
 
   // SAVE
   if (x >= 565 && x <= 760 && y >= 295 && y <= 355) {
-    if (calDone[0] && calDone[1] && calDone[2] && calDone[3]) {
+    bool anyDone = false;
+    for (int i = 0; i < CAL_N; i++) if (calDone[i]) anyDone = true;
+    if (anyDone) {
+      // tell the Pi which rows to actually write this session
+      String changed = "";
+      for (int i = 0; i < CAL_N; i++)
+        if (calDone[i]) changed += String(CAL_CORNERS[i]) + ",";
+      Serial.println("CAL_CHANGED:" + changed);
+      delay(30);
       Serial.println("CAL_SAVE");
-      calMessage = "Saving...";
+      calMessage = "Saving...";          // CAL_SAVED then takes us to the start page
     } else {
-      calMessage = "Capture all four corners first!";
+      calMessage = "Capture at least one spot first!";
     }
     drawCalibrationScreen();
     return;
@@ -915,5 +1109,142 @@ void handleTouchCalibration(int x, int y) {
       drawCalibrationScreen();
       return;
     }
+  }
+}
+
+// =========================================================================
+//  CAMERA CALIBRATION SCREEN  (Pi is headless - everything happens here)
+//  The Pi sends a small RGB565 snapshot; we show it, the user straightens
+//  the barrel curve with +/-, taps the four board corners, and saves.
+// =========================================================================
+void receiveCameraImage(int w, int h) {
+  // read exactly w*h*2 bytes of big-endian RGB565 into camImg
+  long total = (long)w * h * 2;
+  long got = 0;
+  uint8_t hi, lo;
+  int idx = 0;
+  unsigned long t0 = millis();
+  while (got < total && (millis() - t0) < 8000) {
+    if (Serial.available() >= 2) {
+      hi = Serial.read();
+      lo = Serial.read();
+      if (idx < CAM_W * CAM_H) camImg[idx++] = ((uint16_t)hi << 8) | lo;
+      got += 2;
+      t0 = millis();
+    }
+  }
+  camImgReady = (got >= total);
+}
+
+void drawCameraCalScreen() {
+  tft.fillScreen(tft.color565(15, 15, 20));
+  tft.setTextColor(TFT_WHITE);
+  tft.setTextSize(2);
+  tft.drawString("CAMERA CALIBRATION", 20, 20);
+
+  if (camImgReady) {
+    // exact integer scale so the image, corner dots, and tap-mapping all agree
+    tft.startWrite();
+    for (int yy = 0; yy < CAM_H; yy++) {
+      for (int xx = 0; xx < CAM_W; xx++) {
+        uint16_t c = camImg[yy * CAM_W + xx];
+        tft.fillRect(CAM_VIEW_X + xx * CAM_ZOOM, CAM_VIEW_Y + yy * CAM_ZOOM,
+                     CAM_ZOOM, CAM_ZOOM, c);
+      }
+    }
+    tft.endWrite();
+  } else {
+    tft.setTextColor(TFT_YELLOW);
+    tft.setTextSize(2);
+    tft.drawString("Waiting for image from Pi...", CAM_VIEW_X, 300);
+  }
+
+  // draw tapped corners
+  const char* lbl[4] = {"a1", "h1", "h8", "a8"};
+  for (int i = 0; i < camCornerN; i++) {
+    int px = CAM_VIEW_X + camCorners[i][0] * CAM_ZOOM;
+    int py = CAM_VIEW_Y + camCorners[i][1] * CAM_ZOOM;
+    tft.fillCircle(px, py, 5, TFT_GREEN);
+    tft.setTextColor(TFT_GREEN);
+    tft.drawString(lbl[i], px + 8, py - 8);
+  }
+
+  // instructions + buttons on the right
+  int bx = 560;
+  tft.setTextColor(tft.color565(180, 180, 190));
+  tft.setTextSize(2);
+  if (camCornerN < 4)
+    tft.drawString("Tap corner: " + String(lbl[camCornerN]), bx, 70);
+  else
+    tft.drawString("All 4 set - SAVE", bx, 70);
+
+  // NEW PICTURE - grab a fresh snapshot from the camera
+  tft.fillRoundRect(bx, 120, 160, 50, 8, tft.color565(40, 110, 160));
+  tft.drawRoundRect(bx, 120, 160, 50, 8, TFT_WHITE);
+  tft.setTextColor(TFT_WHITE); tft.setTextSize(2);
+  tft.drawCenterString("NEW PICTURE", bx + 80, 137);
+
+  // undo
+  tft.fillRoundRect(bx, 260, 160, 45, 8, tft.color565(80, 60, 30));
+  tft.drawRoundRect(bx, 260, 160, 45, 8, TFT_WHITE);
+  tft.setTextColor(TFT_WHITE);
+  tft.drawCenterString("UNDO CORNER", bx + 80, 274);
+
+  // save
+  tft.fillRoundRect(bx, 320, 160, 55, 8,
+                    camCornerN == 4 ? tft.color565(30, 140, 60) : tft.color565(50, 50, 55));
+  tft.drawRoundRect(bx, 320, 160, 55, 8, TFT_WHITE);
+  tft.setTextColor(camCornerN == 4 ? TFT_WHITE : tft.color565(110, 110, 110));
+  tft.setTextSize(3);
+  tft.drawCenterString("SAVE", bx + 80, 335);
+
+  // cancel
+  tft.fillRoundRect(bx, 390, 160, 45, 8, tft.color565(110, 35, 35));
+  tft.drawRoundRect(bx, 390, 160, 45, 8, TFT_WHITE);
+  tft.setTextColor(TFT_WHITE); tft.setTextSize(2);
+  tft.drawCenterString("CANCEL", bx + 80, 404);
+}
+
+void handleTouchCameraCal(int x, int y) {
+  int bx = 560;
+
+  // NEW PICTURE - ask the Pi for a fresh snapshot
+  if (x >= bx && x <= bx + 160 && y >= 120 && y <= 170) {
+    Serial.println("CAM_REFRESH");
+    camCornerN = 0;                    // clear taps; you're re-framing
+    tft.fillRect(bx, 96, 220, 20, tft.color565(15, 15, 20));
+    tft.setTextColor(TFT_YELLOW);
+    tft.setTextSize(2);
+    tft.drawString("new picture...", bx, 96);
+    return;
+  }
+
+  // undo
+  if (x >= bx && x <= bx + 160 && y >= 260 && y <= 305) {
+    if (camCornerN > 0) { camCornerN--; Serial.println("CAM_UNDO"); drawCameraCalScreen(); }
+    return;
+  }
+  // save
+  if (x >= bx && x <= bx + 160 && y >= 320 && y <= 375) {
+    if (camCornerN == 4) Serial.println("CAM_SAVE");
+    return;
+  }
+  // cancel
+  if (x >= bx && x <= bx + 160 && y >= 390 && y <= 435) {
+    Serial.println("CAM_CANCEL");
+    return;
+  }
+
+  // tap inside the image = a corner
+  if (camImgReady && camCornerN < 4 &&
+      x >= CAM_VIEW_X && x <= CAM_VIEW_X + CAM_VIEW_W &&
+      y >= CAM_VIEW_Y && y <= CAM_VIEW_Y + CAM_VIEW_H) {
+    int ix = (x - CAM_VIEW_X) / CAM_ZOOM;
+    int iy = (y - CAM_VIEW_Y) / CAM_ZOOM;
+    camCorners[camCornerN][0] = ix;
+    camCorners[camCornerN][1] = iy;
+    camCornerN++;
+    Serial.println("CAM_CORNER:" + String(ix) + "," + String(iy));
+    drawCameraCalScreen();
   }
 }

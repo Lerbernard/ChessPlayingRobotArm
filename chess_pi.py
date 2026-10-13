@@ -107,9 +107,10 @@ BOARD_OFFSET_Y = 0.0
 
 OVERRIDES = {}
 
-# The screen's message line is narrow: anything longer than this is cut off.
-# Every message to the screen goes through msg(), which keeps to this length.
-MSG_MAX = 26
+# The screen wraps a message over two lines of 24 characters (or four short
+# lines beyond that). Every message to the screen goes through msg(), which
+# keeps to this length so nothing ever runs off the panel.
+MSG_MAX = 48
 
 
 # ================================================================ SERIAL
