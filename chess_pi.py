@@ -888,27 +888,80 @@ def grave_slot(colour):
     return grave_spot(colour)
 
 def arm_remove_piece(square, piece_symbol):
+    """
+    Carry the captured piece off `square` to a pile. Returns True if the arm
+    believes it did; the caller still checks the square with the camera,
+    because "believes" has included a close that never gripped.
+    """
     colour = "w" if piece_symbol.isupper() else "b"
     px, py, pz = coords(square, piece_symbol)
-    if grave_spot(colour) is None:
-        print(f"  [ARM] no {colour} pile calibrated - leaving {square}")
-        return
-    gx, gy, gz = grave_slot(colour)
+    pile = grave_spot(colour)
+    if pile is None:
+        # A pile is a pile: if only the other colour's was calibrated, use it.
+        pile = grave_spot("b" if colour == "w" else "w")
+        if pile is None:
+            print(f"  [ARM] no pile calibrated - cannot take {square} off")
+            return False
+        print(f"  [ARM] no {colour} pile calibrated - using the other one")
+    gx, gy, gz = pile
     gz = gz + 25.0          # release above the pile so stacked pieces don't jam
-    print(f"  [ARM] capture {square} -> {colour} pile (piece #{_graves[colour]+1})")
+    print(f"  [ARM] capture {square} -> pile (piece #{_graves[colour]+1})")
     px, py, ok_p = reach_ok(px, py)
     gx, gy, ok_g = reach_ok(gx, gy)
     if not (ok_p and ok_g):
-        print("  [ARM] capture square out of reach - remove that piece by hand")
-        msg(f"Take {square} off by hand")
-        return
+        print("  [ARM] capture square or pile out of reach")
+        return False
     if not pick(px, py, pz, square):
-        print(f"  [ARM] {square}: pick failed - remove the piece by hand")
-        msg(f"Take {square} off by hand")
-        return
+        print(f"  [ARM] {square}: pick failed")
+        return False
     if not place(gx, gy, gz, "pile"):
-        msg("Pile unreachable: by hand")
+        print("  [ARM] could not reach the pile - the piece went down short of it")
+        return False
     _graves[colour] += 1
+    return True
+
+class GameReset(Exception):
+    """The screen sent RESET while we were waiting on the human."""
+
+def ask_human_to_clear(square, timeout=180.0):
+    """
+    Put the screen's PIECE CAPTURED prompt up for `square` and wait until the
+    human taps DONE. Returns True once they have. RESET abandons the game.
+    """
+    send(f"REMOVE:{square}")
+    print(f"  [Capture] asking you to take the piece off {square} ...")
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        line = esp.readline().decode(errors="ignore").strip()
+        if not line:
+            continue
+        print(f"<- ESP: {line}")
+        if line == "REMOVED":
+            snapshot_baseline()           # the board changed by hand
+            return True
+        if line == "RESET":
+            raise GameReset()
+    print(f"  [Capture] no answer from the screen after {timeout:.0f}s")
+    return False
+
+def clear_square(square, piece_symbol):
+    """
+    Get the captured piece OFF `square` - by arm if it can, by the human if
+    not - and only return True once the camera agrees the square is empty.
+    Putting the mover down on top of a piece that was still there was the
+    worst thing a capture could do, and three different failures led to it.
+    """
+    removed = arm_remove_piece(square, piece_symbol)
+    go_park()                     # clear of the camera, and of the human's hand
+    time.sleep(0.3)
+    snapshot_baseline()
+    seen = camera_colours(_baseline.get("snap"))
+    still_there = seen is not None and seen.get(square, "none") != "none"
+    if removed and not still_there:
+        return True
+    if removed:
+        print(f"  [Capture] {square}: the camera still sees a piece - the grab missed")
+    return ask_human_to_clear(square)
 
 
 # ================================================================ ENGINE
@@ -1225,20 +1278,27 @@ def engine_play(force=False):
     from_sq = chess.square_name(move.from_square)
     to_sq   = chess.square_name(move.to_square)
 
+    arm_plays = True
     if board.is_capture(move):
         vsq = victim_square(move)
         victim = board.piece_at(chess.parse_square(vsq))
-        arm_remove_piece(vsq, victim.symbol() if victim else "p")
+        if not clear_square(vsq, victim.symbol() if victim else "p"):
+            # The square is not clear and nobody cleared it. Record the move,
+            # but do NOT stack the mover on top - ask for the move by hand.
+            print(f"  [Capture] {vsq} still occupied - not moving the arm")
+            msg(f"Play {uci} by hand")
+            arm_plays = False
 
     is_castle = board.is_castling(move)
     kingside  = board.is_kingside_castling(move)
-    arm_move_piece(from_sq, to_sq, symbol)
-    if is_castle:
-        rank = from_sq[1]
-        if kingside:
-            arm_move_piece("h" + rank, "f" + rank, "r")
-        else:
-            arm_move_piece("a" + rank, "d" + rank, "r")
+    if arm_plays:
+        arm_move_piece(from_sq, to_sq, symbol)
+        if is_castle:
+            rank = from_sq[1]
+            if kingside:
+                arm_move_piece("h" + rank, "f" + rank, "r")
+            else:
+                arm_move_piece("a" + rank, "d" + rank, "r")
 
     board.push(move)
     go_park()                 # <-- clear the camera's view
@@ -2296,6 +2356,13 @@ def main():
                 if apply_human_move(line):
                     snapshot_baseline()
 
+        except GameReset:
+            print("[Host] RESET from the screen - game abandoned")
+            board.reset()
+            auto_detect["on"] = False
+            auto_detect["queue"].clear()
+            auto_detect["arm_busy"] = False
+            go_park()
         except Exception as e:
             print(f"[Error] {type(e).__name__}: {e}")
 

@@ -127,11 +127,72 @@ def main():
     check(chess_pi._pending["count"] == 0 and chess_pi.board.turn == chess.WHITE,
           "forced -> engine played b8c6 anyway")
 
+    # ---------------- 3. a capture never stacks pieces ----------------
+    print("\n=== capture: the square must be empty before the mover goes down ===")
+    import test_arm_path as T
+
+    def setup_capture():
+        # after 1.e4 d5 - the engine (black) can take: d5xe4
+        chess_pi.board.set_fen("rnbqkbnr/ppp1pppp/8/3p4/4P3/8/PPPP1PPP/RNBQKBNR b KQkq e3 0 2")
+        chess_pi.human_is_white = True
+        fake_engine.play.return_value = types.SimpleNamespace(
+            move=chess.Move.from_uci("d5e4"))
+        chess_pi._pending["count"] = 0
+        chess_pi._last[:] = [205.1, -5.4, 120.0]
+        chess_pi._claw["closed"] = None
+        T.MOVES.clear()
+        sent.clear()
+
+    def closes():
+        return sum(1 for m in T.MOVES if m[0] == "grip" and m[1] is True)
+
+    before = chess.Board("rnbqkbnr/ppp1pppp/8/3p4/4P3/8/PPPP1PPP/RNBQKBNR b KQkq e3 0 2")
+
+    # A: the arm takes the pawn off e4 and the camera agrees -> normal capture
+    setup_capture()
+    cleared = looks_like(chess_pi, before); cleared["e4"] = "none"   # pawn gone
+    chess_pi._baseline["snap"] = cleared
+    chess_pi.engine_play()
+    check(not any(m.startswith("REMOVE:") for m in sent) and closes() == 2,
+          "arm cleared e4, camera agrees -> no prompt, mover placed")
+
+    # B: the arm "removed" it but the camera still sees the pawn -> ask the human
+    setup_capture()
+    chess_pi._baseline["snap"] = looks_like(chess_pi, before)  # e4 still green
+    chess_pi.esp.readline = lambda: b"REMOVED\n"
+    chess_pi.engine_play()
+    check("REMOVE:e4" in sent, "grab missed -> screen asked to take e4 off")
+    check(closes() == 2 and chess_pi.board.turn == chess.WHITE,
+          "after DONE the mover was placed and the move recorded")
+
+    # C: nobody clears it -> record the move but do NOT put the mover on top
+    setup_capture()
+    chess_pi._baseline["snap"] = looks_like(chess_pi, before)
+    chess_pi.esp.readline = lambda: b""
+    real_ask = chess_pi.ask_human_to_clear
+    chess_pi.ask_human_to_clear = lambda sq, timeout=0.0: real_ask(sq, timeout=0.0)
+    chess_pi.engine_play()
+    chess_pi.ask_human_to_clear = real_ask
+    check(closes() == 1, "no answer -> the mover was NOT placed on the occupied square")
+    check(any("by hand" in m for m in sent), f"asked for the move by hand: {sent[-3:]}")
+
+    # D: RESET tapped on the prompt -> the game is abandoned cleanly
+    setup_capture()
+    chess_pi._baseline["snap"] = looks_like(chess_pi, before)
+    chess_pi.esp.readline = lambda: b"RESET\n"
+    try:
+        chess_pi.engine_play()
+        check(False, "RESET during the prompt should raise GameReset")
+    except chess_pi.GameReset:
+        check(closes() == 1, "RESET -> stopped before placing anything")
+    chess_pi.esp.readline = lambda: b""
+
     print()
     if failures:
         print(f"{len(failures)} FAILED")
         return 1
-    print("OK: moves can be read off the board, and the lockout has two ways out.")
+    print("OK: moves can be read off the board, the lockout has two ways out, "
+          "and a capture never stacks.")
     return 0
 
 
