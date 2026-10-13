@@ -107,6 +107,10 @@ BOARD_OFFSET_Y = 0.0
 
 OVERRIDES = {}
 
+# The screen's message line is narrow: anything longer than this is cut off.
+# Every message to the screen goes through msg(), which keeps to this length.
+MSG_MAX = 26
+
 
 # ================================================================ SERIAL
 import serial
@@ -121,6 +125,13 @@ esp.reset_input_buffer()
 def send(msg):
     esp.write((msg + "\n").encode())
     print(f"  -> ESP: {msg}")
+
+def msg(text):
+    """A one-line message for the screen, cut to what it can show."""
+    text = " ".join(text.split())
+    if len(text) > MSG_MAX:
+        text = text[:MSG_MAX - 1].rstrip() + "~"
+    send("MSG:" + text)
 
 
 # ================================================================ ARM
@@ -215,7 +226,8 @@ def _claw_cmd(fn, val, dwell):
 # What we last COMMANDED the claw to do. None = unknown (at startup we have no
 # idea where the fingers are, so the first command is always sent). Knowing the
 # state lets us skip a repeat command, and each one costs a full second of dwell.
-_claw = {"closed": None}
+# "pump" is whether the air pump was left running by the last command.
+_claw = {"closed": None, "pump": None}
 
 def claw_open(force=False):
     """
@@ -228,6 +240,7 @@ def claw_open(force=False):
         return                      # already open - don't burn a second on it
     _claw_cmd(arm.grip, False, 0.9)
     _claw["closed"] = False
+    _claw["pump"] = True
 
 def claw_close(force=False):
     """CLOSE on the piece. Again grip() only."""
@@ -235,10 +248,36 @@ def claw_close(force=False):
         return
     _claw_cmd(arm.grip, True, 1.0)
     _claw["closed"] = True
+    _claw["pump"] = True
 
 def claw_pump_off():
     """Stop the air pump once the arm is clear (quiet between moves)."""
+    if _claw["pump"] is False:
+        return
     _claw_cmd(arm.suck, False, 0.2)
+    _claw["pump"] = False
+
+def claw_ready():
+    """
+    Get the claw into the ONE state every pick starts from: open, pump off.
+    The pneumatic gripper is only reliable when each close starts from the
+    same place - a close sent while the pump is already running on "open" is
+    the one that was seen to do nothing on the first move of a game.
+    """
+    claw_open()
+    claw_pump_off()
+
+def claw_prime():
+    """
+    Cycle the gripper once, with the arm parked high and clear. The original
+    script did this by accident at every boot (its self-test crashed, but the
+    gripper test after it still ran), and the first close of a game only
+    worked BECAUSE of it: the pump and valve need one cycle after power-up.
+    """
+    print("[Gripper] priming: close, open, pump off")
+    claw_close(force=True)
+    claw_open(force=True)
+    claw_pump_off()
 
 def control_claw(grab):
     """Close or open the claw (always sent - used by the gripper self-test)."""
@@ -362,7 +401,9 @@ def _goto(x, y, z, label="", nudge=True):
     # that IS worth a retry, so it falls through below.)
     moved = math.dist(start, (_last[0], _last[1], _last[2])) if start else 999.0
     r_want, r_got = math.hypot(x, y), math.hypot(_last[0], _last[1])
-    if moved > 2.0 and abs(r_got - r_want) > VERIFY_TOL:
+    r_from = math.hypot(start[0], start[1]) if start else r_want
+    went_radial = abs(r_want - r_from) > VERIFY_TOL     # not a plain descent
+    if went_radial and moved > 2.0 and abs(r_got - r_want) > VERIFY_TOL:
         print(f"  [Move] {label}: stopped {r_got:.0f}mm from the base, asked "
               f"for {r_want:.0f}mm - the arm cannot reach that far "
               f"{'in' if r_got > r_want else 'out'} at z={z:.0f}")
@@ -668,7 +709,7 @@ def retreat(square="?"):
 def pick(x, y, z, square="?"):
     """Open the claw, get to the square, close on the piece, come away."""
     print(f"  [Pick] {square} at ({x:.1f}, {y:.1f}, {z:.1f})")
-    claw_open()                                   # opens while it travels
+    claw_ready()                                  # open, pump off - always
     if not approach(x, y, z, square):
         print(f"  [Pick] {square}: could not get to the piece - not grabbing "
               f"(the [Move] line above says where the arm actually stopped)")
@@ -826,14 +867,14 @@ def arm_move_piece(from_sq, to_sq, piece_symbol):
     if not (ok_f and ok_t):
         print(f"  [ARM] refusing {from_sq}->{to_sq}: a square is out of reach - "
               f"please move that piece by hand")
-        send("MSG:square out of reach - move that piece by hand")
+        msg("Out of reach: do by hand")
         return
     if not pick(fx, fy, fz, from_sq):
         print(f"  [ARM] {from_sq}: pick failed - not placing anything")
-        send("MSG:could not pick up the piece - check the board")
+        msg(f"Grab failed on {from_sq}")
         return
     if not place(tx, ty, tz, to_sq):
-        send(f"MSG:could not place on {to_sq} - put it there by hand")
+        msg(f"Put piece on {to_sq} by hand")
 
 def grave_spot(colour):
     return GRAVE_W if colour == "w" else GRAVE_B
@@ -858,14 +899,14 @@ def arm_remove_piece(square, piece_symbol):
     gx, gy, ok_g = reach_ok(gx, gy)
     if not (ok_p and ok_g):
         print("  [ARM] capture square out of reach - remove that piece by hand")
-        send("MSG:captured piece out of reach - remove it by hand")
+        msg(f"Take {square} off by hand")
         return
     if not pick(px, py, pz, square):
         print(f"  [ARM] {square}: pick failed - remove the piece by hand")
-        send("MSG:could not pick up the captured piece")
+        msg(f"Take {square} off by hand")
         return
     if not place(gx, gy, gz, "pile"):
-        send("MSG:could not reach the pile - take the piece off by hand")
+        msg("Pile unreachable: by hand")
     _graves[colour] += 1
 
 
@@ -1024,6 +1065,61 @@ def board_vs_camera(chessboard, snap):
             bad.append((name, expected, seen))
     return bad
 
+def camera_colours(snap):
+    """One colour word per square ("green"/"blue"/"none") as the camera sees it."""
+    snap = orient_snap(snap)
+    if not snap:
+        return None
+    return {chess.square_name(i): piece_colour(snap.get(chess.square_name(i)))
+            for i in chess.SQUARES}
+
+def expected_colours(chessboard):
+    """The same, as the GAME says the board should look."""
+    human_colour = chess.WHITE if human_is_white else chess.BLACK
+    out = {}
+    for i in chess.SQUARES:
+        pc = chessboard.piece_at(i)
+        out[chess.square_name(i)] = ("none" if pc is None else
+                                     "green" if pc.color == human_colour else "blue")
+    return out
+
+def disagreements(expected, seen):
+    """Squares where the camera and the game differ."""
+    return [sq for sq in expected if expected[sq] != seen.get(sq, "none")]
+
+def infer_human_move(seen, chessboard=None, limit=1):
+    """
+    Which LEGAL move makes the game look like what the camera sees right now?
+
+    This does not use the before/after baseline at all, which is the point:
+    once a move has been rejected (or missed) the baseline absorbs it, and
+    diffing against that baseline can never find it again - the game is stuck
+    until RESET. Matching the camera against the legal moves instead works
+    from any state.
+
+    Returns (uci, status): status is "move" (uci set), "unchanged" (the
+    camera matches the position as it is - nobody has moved) or "unclear".
+    """
+    chessboard = board if chessboard is None else chessboard
+    if not seen:
+        return None, "unclear"
+    as_is = len(disagreements(expected_colours(chessboard), seen))
+    scored = []
+    for mv in chessboard.legal_moves:
+        if mv.promotion and mv.promotion != chess.QUEEN:
+            continue                     # the camera cannot tell promotions apart
+        trial = chessboard.copy(stack=False)
+        trial.push(mv)
+        scored.append((len(disagreements(expected_colours(trial), seen)), mv.uci()))
+    scored.sort()
+    if as_is <= limit and (not scored or scored[0][0] >= as_is):
+        return None, "unchanged"
+    if scored and scored[0][0] <= limit:
+        if len(scored) > 1 and scored[1][0] == scored[0][0]:
+            return None, "unclear"       # two moves fit equally - do not guess
+        return scored[0][1], "move"
+    return None, "unclear"
+
 def state_is_sane(chessboard, snap, limit=1):
     """True if the camera broadly agrees with the game state."""
     bad = board_vs_camera(chessboard, snap)
@@ -1080,14 +1176,34 @@ def check_move_done(from_sq, to_sq, colour="blue"):
 
 _last_engine_move = {"uci": None, "fen": None}
 
-def engine_play():
+# An engine reply that is waiting for the board to be put right. "count" is
+# how many times it has refused; "snap" is the camera snapshot it last judged,
+# so the main loop can re-check when a NEW snapshot arrives (the human fixing
+# the board) without re-judging the same picture over and over.
+_pending = {"count": 0, "snap": None}
+
+def engine_play(force=False):
     """Engine picks a move, the arm plays it, then parks off-board."""
     # Refuse to touch the pieces if the camera and the game state disagree -
-    # moving on a wrong board is how pieces end up in random places.
-    if not state_is_sane(board, _baseline.get("snap")):
-        print("[Engine] NOT MOVING - fix the board (or re-take a photo) first")
-        send("MSG:board does not match the game - check the pieces")
+    # moving on a wrong board is how pieces end up in random places. But never
+    # trap the game here: the squares are named on the screen, END TURN
+    # re-checks after the fix, and a second END TURN plays anyway.
+    if not force and not state_is_sane(board, _baseline.get("snap")):
+        _pending["count"] += 1
+        _pending["snap"] = _baseline.get("snap")
+        bad = board_vs_camera(board, _baseline.get("snap"))
+        squares = " ".join(n for n, _, _ in bad[:3])
+        print("[Engine] NOT MOVING - fix the board, then END TURN "
+              "(END TURN twice = play anyway)")
+        if _pending["count"] >= 2:
+            msg(f"Fix {squares}. Again=force")
+        else:
+            msg(f"Fix {squares} then END TURN")
         return
+    if force:
+        print("[Engine] playing on a board the camera disputes - you asked")
+    _pending["count"] = 0
+    _pending["snap"] = None
     auto_detect["arm_busy"] = True        # pause auto-detect while the arm moves
     print(f"[Engine] thinking from move {board.fullmove_number}, "
           f"{'white' if board.turn == chess.WHITE else 'black'} to play")
@@ -1136,10 +1252,10 @@ def engine_play():
             print(f"  [Check] {uci}: confirmed on the board")
         elif state == "not_moved":
             print(f"  [Check] {uci}: piece still on {from_sq} - the grab missed")
-            send("MSG:arm missed the piece - check the board")
+            msg(f"Missed: play {uci} by hand")
         elif state == "lost":
             print(f"  [Check] {uci}: {from_sq} and {to_sq} both empty - dropped")
-            send("MSG:piece dropped - please place it by hand")
+            msg(f"Dropped: put on {to_sq}")
 
     auto_detect["arm_busy"] = False       # resume watching for the human
     send(uci)
@@ -1159,6 +1275,15 @@ def _rescue_castle(uci):
         if board.is_castling(m) and chess.square_name(m.from_square) == frm:
             return m.uci()
     return None
+
+def _is_playable(uci):
+    """Legal as given, or rescuable into a legal castle."""
+    try:
+        if chess.Move.from_uci(uci) in board.legal_moves:
+            return True
+    except ValueError:
+        pass
+    return _rescue_castle(uci) is not None
 
 def apply_human_move(uci):
     """The human already moved the piece by hand; we just record + reply."""
@@ -1761,12 +1886,20 @@ def camera_thread():
                                         or (trial is not None
                                             and not state_is_sane(trial, orient_snap(now), limit=2))):
                                     print(f"[Auto] REJECTED {uci} - the board does "
-                                          f"not look like that. Nothing played.")
+                                          f"not look like that.")
                                     uci = None
                                 else:
                                     print(f"[Auto] colour-detect: {uci}")
                                     auto_detect["queue"].append(uci)
-                            else:
+                            if uci is None:
+                                # second opinion, baseline-free: which legal
+                                # move makes the board look like this?
+                                guess, status = infer_human_move(camera_colours(now))
+                                if guess:
+                                    print(f"[Auto] camera vs legal moves: {guess}")
+                                    auto_detect["queue"].append(guess)
+                                    uci = guess
+                            if uci is None:
                                 # fallback: old image-diff classifier
                                 kept, _ = diff_squares(_baseline["snap"], now)
                                 info = classify_change(kept, _baseline["snap"], now)
@@ -1997,14 +2130,25 @@ def main():
         print("[Host] skipping the startup self-test (SELFTEST_AT_START=False)."
               " Press ARM TEST on the screen to run it.")
 
-    print("\n[Host] ready. Drive everything from the touchscreen.\n")
     go_park()
+    claw_prime()               # no motion, but the gripper needs one cycle
+    print("\n[Host] ready. Drive everything from the touchscreen.\n")
 
     esp.timeout = 0.2                 # short read so we can also poll auto-detect
 
     while True:
+        # ---- an engine reply is waiting for the board to be put right ----
+        if _pending["count"]:
+            auto_detect["queue"].clear()       # fixing the board is not a move
+            snap = _baseline.get("snap")
+            if snap is not None and snap is not _pending["snap"]:
+                _pending["snap"] = snap        # a fresh picture: look again
+                if state_is_sane(board, snap):
+                    print("[Engine] board matches the game again - replying")
+                    engine_play()
+
         # ---- play any move the camera auto-detected ----
-        if auto_detect["on"] and auto_detect["queue"] and not auto_detect["arm_busy"]:
+        elif auto_detect["on"] and auto_detect["queue"] and not auto_detect["arm_busy"]:
             uci = auto_detect["queue"].pop(0)
             print(f"[Auto] playing detected move {uci}")
             if not board.is_game_over():
@@ -2106,17 +2250,36 @@ def main():
             # ---- the human finished their move ----
             elif line == "END_TURN":
                 send("READING")
-                uci = detect_move()
+                if _pending["count"]:
+                    # The engine is waiting for the board to be fixed. Look
+                    # again now; the second press plays anyway.
+                    snapshot_baseline()
+                    engine_play(force=_pending["count"] >= 2)
+                    continue
+                uci = detect_move()            # before/after diff (baseline := now)
+                seen = camera_colours(_baseline.get("snap"))
+                if uci is not None and not _is_playable(uci):
+                    print(f"[Turn] diff said {uci} but that is not legal here")
+                    uci = None
                 if uci is None:
-                    send("NO_MOVE")
-                    print("[Turn] camera saw no clear move")
-                else:
-                    ok = apply_human_move(uci)
-                    if not ok:
-                        # rejected - resync the screen and let them retry
-                        snapshot_baseline()
+                    # The diff found nothing it trusts. Ask a different
+                    # question: which legal move makes the board look like
+                    # THIS? That works even after a rejected or absorbed move.
+                    uci, status = infer_human_move(seen)
+                    if uci:
+                        print(f"[Turn] camera vs legal moves: {uci}")
+                    elif status == "unchanged":
+                        print("[Turn] the board still shows the current position")
+                        send("NO_MOVE")
+                        msg("No move seen yet")
                     else:
-                        snapshot_baseline()  # arm has parked; new 'before'
+                        bad = disagreements(expected_colours(board), seen or {})
+                        print(f"[Turn] cannot read a move; odd squares: {bad[:6]}")
+                        send("NO_MOVE")
+                        msg("Unclear: " + " ".join(bad[:3]))
+                if uci is not None:
+                    apply_human_move(uci)      # ILLEGAL / engine reply inside
+                    snapshot_baseline()        # arm has parked; new 'before'
 
             elif line == "ARM_TEST":
                 arm_selftest()
