@@ -66,6 +66,13 @@ THINK_TIME     = 0.5
 # by default so the arm stays parked until there is a real move to play; the
 # ARM TEST button on the touchscreen still runs it whenever you want it.
 SELFTEST_AT_START = False
+# Re-home the arm every N engine moves (0 = never). Every time the arm is
+# stopped short - a reach limit, an alarm, a knock - its steppers can lose
+# steps, and the Dobot has no way to notice: from then on every square is a
+# little further off than the last. Homing runs the arm to its reference
+# position and resets that. It takes ~20 s and swings the arm, so watch the
+# first one to be sure its path clears your board before leaving it on.
+HOME_EVERY_MOVES = 0
 # The arm's workspace is a SHELL, not a cylinder: up in the travel lane it
 # cannot fold in as close to its base - nor stretch as far out - as it can
 # down at board height. A square just inside that limit is reachable at PIECE
@@ -127,6 +134,17 @@ def send(msg):
     esp.write((msg + "\n").encode())
     print(f"  -> ESP: {msg}")
 
+def _flush_screen_input():
+    """
+    Throw away anything the screen sent while the arm was busy. A finger on
+    END TURN during a 20-second arm move would otherwise be acted on minutes
+    later, when it means nothing - and they pile up over a long game.
+    """
+    try:
+        esp.reset_input_buffer()
+    except Exception:
+        pass
+
 def msg(text):
     """A one-line message for the screen, cut to what it can show."""
     text = " ".join(text.split())
@@ -178,6 +196,38 @@ def clear_alarms():
         print(f"[Arm] could not clear alarms: {e}")
 
 clear_alarms()
+
+def home_arm():
+    """
+    Run the Dobot's HOME routine (SetHOMECmd). pydobot has no call for it,
+    so the message is built here the same way clear_alarms() builds its own.
+    Afterwards the arm's position is trusted again - and unknown to us, so
+    _last is reset and the next move starts with a pose read.
+    """
+    try:
+        from pydobot.message import Message
+        from pydobot.enums.CommunicationProtocolIDs import CommunicationProtocolIDs
+        from pydobot.enums.ControlValues import ControlValues
+        msg_ = Message()
+        msg_.id = CommunicationProtocolIDs.SET_HOME_CMD
+        msg_.ctrl = ControlValues.THREE
+        msg_.params = bytearray(4)         # HOMECmd.reserved
+        print("[Arm] homing (about 20 s) ...")
+        resp = arm._send_command(msg_)
+        idx = None
+        try:
+            if resp is not None and getattr(resp, "params", None):
+                idx = _struct.unpack_from("L", resp.params, 0)[0]
+        except Exception:
+            idx = None
+        if idx is not None:
+            _wait_queue(idx, timeout=90.0)
+        else:
+            time.sleep(25.0)
+        _last[0] = _last[1] = _last[2] = 999.0
+        print("[Arm] homed")
+    except Exception as e:
+        print(f"[Arm] could not home: {e}")
 
 def dobot(fn, *a, tries=4, **kw):
     for i in range(tries):
@@ -881,11 +931,16 @@ def grave_spot(colour):
     return GRAVE_W if colour == "w" else GRAVE_B
 
 _graves = {"w": 0, "b": 0}
-def grave_slot(colour):
-    # Every captured piece goes to the SAME calibrated drop point - they just
-    # pile up there. The old per-slot 28 mm offsets made the drop spot march
-    # further away with every capture, eventually leaving the arm's reach.
-    return grave_spot(colour)
+
+# Where successive captured pieces go, relative to the calibrated pile spot,
+# in units of one square. Six spots in a tight cluster, then round again: a
+# pile that is all on one point topples by the fourth piece, and the old
+# "28 mm further out each time" marched straight out of the arm's reach.
+PILE_SPREAD = [(0, 0), (1, 0), (0, 1), (1, 1), (-1, 0), (0, -1)]
+
+def grave_slot(colour, x, y, z):
+    dx, dy = PILE_SPREAD[_graves[colour] % len(PILE_SPREAD)]
+    return x + dx * PITCH, y + dy * PITCH, z
 
 def arm_remove_piece(square, piece_symbol):
     """
@@ -903,7 +958,7 @@ def arm_remove_piece(square, piece_symbol):
             print(f"  [ARM] no pile calibrated - cannot take {square} off")
             return False
         print(f"  [ARM] no {colour} pile calibrated - using the other one")
-    gx, gy, gz = pile
+    gx, gy, gz = grave_slot(colour, *pile)
     gz = gz + 25.0          # release above the pile so stacked pieces don't jam
     print(f"  [ARM] capture {square} -> pile (piece #{_graves[colour]+1})")
     px, py, ok_p = reach_ok(px, py)
@@ -971,6 +1026,27 @@ human_is_white = True
 
 # What limit engine_play uses - depth-capped for weak levels, timed otherwise.
 ENGINE_LIMIT = {"limit": chess.engine.Limit(time=THINK_TIME)}
+_engine_opts = {}                 # what set_difficulty last configured
+
+def engine_move():
+    """
+    Ask Stockfish for a move. If the engine process has died (it happens, over
+    a long session), start a fresh one with the same settings and ask again
+    rather than abandoning the game.
+    """
+    global engine
+    try:
+        return engine.play(board, ENGINE_LIMIT["limit"]).move
+    except Exception as e:
+        print(f"[Engine] Stockfish failed ({e}) - restarting it")
+        try:
+            engine.quit()
+        except Exception:
+            pass
+        engine = chess.engine.SimpleEngine.popen_uci(STOCKFISH_PATH)
+        if _engine_opts:
+            engine.configure(dict(_engine_opts))
+        return engine.play(board, ENGINE_LIMIT["limit"]).move
 
 def set_difficulty(elo):
     """
@@ -990,12 +1066,16 @@ def set_difficulty(elo):
         elif elo < 1100: skill, depth = 1, 4
         elif elo < 1200: skill, depth = 2, 5
         else:            skill, depth = 3, 6
-        engine.configure({"UCI_LimitStrength": False, "Skill Level": skill})
+        _engine_opts.clear()
+        _engine_opts.update({"UCI_LimitStrength": False, "Skill Level": skill})
+        engine.configure(dict(_engine_opts))
         ENGINE_LIMIT["limit"] = chess.engine.Limit(depth=depth)
         print(f"[Engine] Elo {elo} -> Skill {skill}, depth {depth}")
     else:
-        engine.configure({"UCI_LimitStrength": True,
-                          "UCI_Elo": max(lo, min(hi, elo))})
+        _engine_opts.clear()
+        _engine_opts.update({"UCI_LimitStrength": True,
+                             "UCI_Elo": max(lo, min(hi, elo))})
+        engine.configure(dict(_engine_opts))
         ENGINE_LIMIT["limit"] = chess.engine.Limit(time=THINK_TIME)
         print(f"[Engine] UCI_Elo {max(lo, min(hi, elo))}")
 
@@ -1259,11 +1339,20 @@ def engine_play(force=False):
     _pending["count"] = 0
     _pending["snap"] = None
     auto_detect["arm_busy"] = True        # pause auto-detect while the arm moves
+    try:
+        _engine_turn()
+    finally:
+        # Whatever went wrong in there - a serial hiccup, a camera timeout -
+        # the game must not be left with auto-detect switched off for good.
+        auto_detect["arm_busy"] = False
+        _flush_screen_input()
+
+def _engine_turn():
+    """One engine move, start to finish. Called with auto-detect paused."""
     print(f"[Engine] thinking from move {board.fullmove_number}, "
           f"{'white' if board.turn == chess.WHITE else 'black'} to play")
     print(f"[Engine] position: {board.board_fen()}")
-    result = engine.play(board, ENGINE_LIMIT["limit"])
-    move = result.move
+    move = engine_move()
     uci = move.uci()
     print(f"[Engine] plays {uci}")
     if uci == _last_engine_move["uci"] and board.board_fen() == _last_engine_move["fen"]:
@@ -1318,7 +1407,10 @@ def engine_play(force=False):
             print(f"  [Check] {uci}: {from_sq} and {to_sq} both empty - dropped")
             msg(f"Dropped: put on {to_sq}")
 
-    auto_detect["arm_busy"] = False       # resume watching for the human
+    if HOME_EVERY_MOVES and board.fullmove_number % HOME_EVERY_MOVES == 0:
+        home_arm()                        # shed any lost steps, then re-park
+        go_park()
+
     send(uci)
     sync_screen()
     report_status()
@@ -1646,6 +1738,13 @@ class PiCam:
             self.cap = cv2.VideoCapture(idx)
         if not self.cap.isOpened():
             raise RuntimeError(f"could not open USB camera (index {idx})")
+        # Keep the driver's frame queue short, so a read() right after the arm
+        # parks shows the board as it is NOW, not a few frames ago with the
+        # arm still in shot.
+        try:
+            self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        except Exception:
+            pass
         # MJPG gives full quality/framerate over USB on most UVC cameras.
         # Try 1080p, then step down until the camera actually delivers frames.
         self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
@@ -1710,6 +1809,12 @@ _baseline = {"snap": None}
 auto_detect = {"on": False, "queue": [], "arm_busy": False}
 
 def _request(action, timeout=120):
+    t = cam_status.get("thread")
+    if t is not None and not t.is_alive():
+        # Do not sit here for two minutes per request for the rest of the
+        # game: say it once, and let the callers carry on without a picture.
+        print("[Cam] the camera thread has stopped - no picture available")
+        return None
     cam_cmd["result"] = None
     cam_cmd["done"].clear()
     cam_cmd["action"] = action
@@ -1841,144 +1946,152 @@ def camera_thread():
     AVG_FRAMES = 4                   # frames averaged into a signature
 
     while True:
-        ok, frame = cap.read()
-        if not ok:
-            time.sleep(0.05); continue
-        frame = undistort(frame, vision["k1"])
-        _cam_cal["frame"] = frame
-        act = cam_cmd["action"]
+        try:
+            ok, frame = cap.read()
+            if not ok:
+                time.sleep(0.05); continue
+            frame = undistort(frame, vision["k1"])
+            _cam_cal["frame"] = frame
+            act = cam_cmd["action"]
 
-        if vision["corners"] is None:
-            time.sleep(0.03)
-            continue
-
-        warped = warp_board(frame, vision["corners"])
-
-        # ---- manual requests still work (baseline / detect via END_TURN) ----
-        if act == "baseline":
-            recent = []
-            for _ in range(AVG_FRAMES):
-                ok2, f2 = cap.read()
-                if ok2:
-                    w2 = warp_board(undistort(f2, vision["k1"]), vision["corners"])
-                    recent.append({n: cell_signature(c)
-                                   for n, c in square_cells(w2).items()})
+            if vision["corners"] is None:
                 time.sleep(0.03)
-            _baseline["snap"] = _avg_signatures(recent) or {
-                n: cell_signature(c) for n, c in square_cells(warped).items()}
-            phase = "stable"; prev_gray = None
-            cam_cmd["result"] = True
-            cam_cmd["action"] = None
-            cam_cmd["done"].set()
-            print("[Cam] baseline captured (averaged)")
+                continue
 
-        elif act == "detect":
-            now = {n: cell_signature(c) for n, c in square_cells(warped).items()}
-            uci = None
-            if _baseline["snap"] is not None:
-                uci = detect_move_by_colour(
-                    orient_snap(_baseline["snap"]), orient_snap(now), board)
-                if uci == "partial":
-                    print("[Cam] castle half-done - move the rook too, then END TURN again")
-                    uci = None
-                elif uci:
-                    print(f"[Cam] colour-detect: {uci}")
-                else:
-                    kept, _ = diff_squares(_baseline["snap"], now)
-                    info = classify_change(kept, _baseline["snap"], now)
-                    uci = info["uci"]
-                    colour = moved_colour(kept, _baseline["snap"], now)
-                    if uci and colour == "blue":
-                        print(f"[Cam] ignoring BLUE move {uci} (arm's piece)")
+            warped = warp_board(frame, vision["corners"])
+
+            # ---- manual requests still work (baseline / detect via END_TURN) ----
+            if act == "baseline":
+                for _ in range(3):              # drop whatever was already queued
+                    cap.read()
+                recent = []
+                for _ in range(AVG_FRAMES):
+                    ok2, f2 = cap.read()
+                    if ok2:
+                        w2 = warp_board(undistort(f2, vision["k1"]), vision["corners"])
+                        recent.append({n: cell_signature(c)
+                                       for n, c in square_cells(w2).items()})
+                    time.sleep(0.03)
+                _baseline["snap"] = _avg_signatures(recent) or {
+                    n: cell_signature(c) for n, c in square_cells(warped).items()}
+                phase = "stable"; prev_gray = None
+                cam_cmd["result"] = True
+                cam_cmd["action"] = None
+                cam_cmd["done"].set()
+                print("[Cam] baseline captured (averaged)")
+
+            elif act == "detect":
+                now = {n: cell_signature(c) for n, c in square_cells(warped).items()}
+                uci = None
+                if _baseline["snap"] is not None:
+                    uci = detect_move_by_colour(
+                        orient_snap(_baseline["snap"]), orient_snap(now), board)
+                    if uci == "partial":
+                        print("[Cam] castle half-done - move the rook too, then END TURN again")
                         uci = None
                     elif uci:
-                        print(f"[Cam] diff-detect {info['kind']}: {uci} ({colour})")
-            _baseline["snap"] = now
-            cam_cmd["result"] = uci
-            cam_cmd["action"] = None
-            cam_cmd["done"].set()
-
-        # ---- AUTOMATIC detection (runs when armed and no manual request) ----
-        elif (auto_detect["on"] and not auto_detect["arm_busy"]
-              and _baseline["snap"] is not None):
-            gray = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
-            gray = cv2.GaussianBlur(gray, (5, 5), 0)
-            if prev_gray is not None:
-                activity = float((cv2.absdiff(prev_gray, gray) > 25).mean())
-
-                if phase == "stable":
-                    if activity > ACT_ON:
-                        phase = "busy"
-                        print("[Auto] motion - waiting for board to clear")
-                elif phase == "busy":
-                    if activity < ACT_OFF:
-                        phase = "settling"; quiet = 0; recent = []
-                elif phase == "settling":
-                    if activity < ACT_OFF:
-                        quiet += 1
-                        # collect stable frames to average
-                        recent.append({n: cell_signature(c)
-                                       for n, c in square_cells(warped).items()})
-                        if len(recent) > AVG_FRAMES:
-                            recent.pop(0)
-                        if quiet >= QUIET_NEED:
-                            now = _avg_signatures(recent)
-                            # 1st choice: colour-state change validated against
-                            # the LEGAL MOVES of the position
-                            uci = detect_move_by_colour(
-                                orient_snap(_baseline["snap"]), orient_snap(now), board)
-                            if uci == "partial":
-                                # king moved, rook not yet - wait for the rook
-                                # with the SAME baseline so the full castle is
-                                # seen as one change
-                                print("[Auto] castle in progress - waiting for the rook")
-                                phase = "stable"
-                                continue
-                            if uci:
-                                # sanity gate: play the move on a COPY and check
-                                # the camera really shows that position. A
-                                # phantom move fails this and is discarded.
-                                trial = board.copy()
-                                try:
-                                    trial.push_uci(uci)
-                                except Exception:
-                                    trial = None
-                                if (not move_looks_real(uci, orient_snap(now), board)
-                                        or (trial is not None
-                                            and not state_is_sane(trial, orient_snap(now), limit=2))):
-                                    print(f"[Auto] REJECTED {uci} - the board does "
-                                          f"not look like that.")
-                                    uci = None
-                                else:
-                                    print(f"[Auto] colour-detect: {uci}")
-                                    auto_detect["queue"].append(uci)
-                            if uci is None:
-                                # second opinion, baseline-free: which legal
-                                # move makes the board look like this?
-                                guess, status = infer_human_move(camera_colours(now))
-                                if guess:
-                                    print(f"[Auto] camera vs legal moves: {guess}")
-                                    auto_detect["queue"].append(guess)
-                                    uci = guess
-                            if uci is None:
-                                # fallback: old image-diff classifier
-                                kept, _ = diff_squares(_baseline["snap"], now)
-                                info = classify_change(kept, _baseline["snap"], now)
-                                uci = info["uci"]
-                                colour = moved_colour(kept, _baseline["snap"], now)
-                                if uci and colour == "blue":
-                                    print(f"[Auto] ignoring BLUE move {uci}")
-                                elif uci:
-                                    print(f"[Auto] diff-detect {info['kind']}: {uci} ({colour})")
-                                    auto_detect["queue"].append(uci)
-                                else:
-                                    print("[Auto] settled but no clear move")
-                            _baseline["snap"] = now
-                            phase = "stable"
+                        print(f"[Cam] colour-detect: {uci}")
                     else:
-                        phase = "busy"        # moved again, keep waiting
-            prev_gray = gray
+                        kept, _ = diff_squares(_baseline["snap"], now)
+                        info = classify_change(kept, _baseline["snap"], now)
+                        uci = info["uci"]
+                        colour = moved_colour(kept, _baseline["snap"], now)
+                        if uci and colour == "blue":
+                            print(f"[Cam] ignoring BLUE move {uci} (arm's piece)")
+                            uci = None
+                        elif uci:
+                            print(f"[Cam] diff-detect {info['kind']}: {uci} ({colour})")
+                _baseline["snap"] = now
+                cam_cmd["result"] = uci
+                cam_cmd["action"] = None
+                cam_cmd["done"].set()
 
+            # ---- AUTOMATIC detection (runs when armed and no manual request) ----
+            elif (auto_detect["on"] and not auto_detect["arm_busy"]
+                  and _baseline["snap"] is not None):
+                gray = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
+                gray = cv2.GaussianBlur(gray, (5, 5), 0)
+                if prev_gray is not None:
+                    activity = float((cv2.absdiff(prev_gray, gray) > 25).mean())
+
+                    if phase == "stable":
+                        if activity > ACT_ON:
+                            phase = "busy"
+                            print("[Auto] motion - waiting for board to clear")
+                    elif phase == "busy":
+                        if activity < ACT_OFF:
+                            phase = "settling"; quiet = 0; recent = []
+                    elif phase == "settling":
+                        if activity < ACT_OFF:
+                            quiet += 1
+                            # collect stable frames to average
+                            recent.append({n: cell_signature(c)
+                                           for n, c in square_cells(warped).items()})
+                            if len(recent) > AVG_FRAMES:
+                                recent.pop(0)
+                            if quiet >= QUIET_NEED:
+                                now = _avg_signatures(recent)
+                                # 1st choice: colour-state change validated against
+                                # the LEGAL MOVES of the position
+                                uci = detect_move_by_colour(
+                                    orient_snap(_baseline["snap"]), orient_snap(now), board)
+                                if uci == "partial":
+                                    # king moved, rook not yet - wait for the rook
+                                    # with the SAME baseline so the full castle is
+                                    # seen as one change
+                                    print("[Auto] castle in progress - waiting for the rook")
+                                    phase = "stable"
+                                    continue
+                                if uci:
+                                    # sanity gate: play the move on a COPY and check
+                                    # the camera really shows that position. A
+                                    # phantom move fails this and is discarded.
+                                    trial = board.copy()
+                                    try:
+                                        trial.push_uci(uci)
+                                    except Exception:
+                                        trial = None
+                                    if (not move_looks_real(uci, orient_snap(now), board)
+                                            or (trial is not None
+                                                and not state_is_sane(trial, orient_snap(now), limit=2))):
+                                        print(f"[Auto] REJECTED {uci} - the board does "
+                                              f"not look like that.")
+                                        uci = None
+                                    else:
+                                        print(f"[Auto] colour-detect: {uci}")
+                                        auto_detect["queue"].append(uci)
+                                if uci is None:
+                                    # second opinion, baseline-free: which legal
+                                    # move makes the board look like this?
+                                    guess, status = infer_human_move(camera_colours(now))
+                                    if guess:
+                                        print(f"[Auto] camera vs legal moves: {guess}")
+                                        auto_detect["queue"].append(guess)
+                                        uci = guess
+                                if uci is None:
+                                    # fallback: old image-diff classifier
+                                    kept, _ = diff_squares(_baseline["snap"], now)
+                                    info = classify_change(kept, _baseline["snap"], now)
+                                    uci = info["uci"]
+                                    colour = moved_colour(kept, _baseline["snap"], now)
+                                    if uci and colour == "blue":
+                                        print(f"[Auto] ignoring BLUE move {uci}")
+                                    elif uci:
+                                        print(f"[Auto] diff-detect {info['kind']}: {uci} ({colour})")
+                                        auto_detect["queue"].append(uci)
+                                    else:
+                                        print("[Auto] settled but no clear move")
+                                _baseline["snap"] = now
+                                phase = "stable"
+                        else:
+                            phase = "busy"        # moved again, keep waiting
+                prev_gray = gray
+
+        except Exception as e:
+            # One bad frame used to kill this thread for good, and then
+            # every snapshot request waited two minutes before giving up.
+            print(f"[Cam] frame skipped: {type(e).__name__}: {e}")
+            time.sleep(0.2)
         time.sleep(0.03)
 
 
@@ -2183,7 +2296,8 @@ def arm_selftest():
 def main():
     global human_is_white
 
-    threading.Thread(target=camera_thread, daemon=True).start()
+    cam_status["thread"] = threading.Thread(target=camera_thread, daemon=True)
+    cam_status["thread"].start()
 
     if SELFTEST_AT_START:          # off by default - see the CONFIG section
         arm_selftest()
@@ -2216,7 +2330,12 @@ def main():
                 apply_human_move(uci)      # records human move + triggers engine
                                            # reply, which re-baselines on park
 
-        line = esp.readline().decode(errors="ignore").strip()
+        try:
+            line = esp.readline().decode(errors="ignore").strip()
+        except Exception as e:                 # a USB hiccup is not the end
+            print(f"[Serial] screen read failed: {e}")
+            time.sleep(0.5)
+            continue
         if not line:
             continue
         print(f"<- ESP: {line}")
